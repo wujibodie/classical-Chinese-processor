@@ -30,7 +30,7 @@ SETUP
    export DASHSCOPE_API_KEY="your_alibaba_key"
    export KIMI_API_KEY="your_moonshot_key"
     ```
-   (replace "export" with "set" on PC)
+   (Windows users replace "export" with "set")
 5. **Run the script**
     ```bash
      python3 cc-prox.py document.pdf --output ./processed

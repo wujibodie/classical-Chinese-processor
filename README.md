@@ -19,20 +19,21 @@ YOU WILL NEED
 SETUP
 
 1. **Install Python** (if you don't have it):
-   - Download from python.org
-   - Or use: `brew install python` on Mac
 2. **Install this script**:
     ```bash
     pip install pdf2image opencv-python openai requests
    git clone [https://github.com/wujibodie/classical-Chinese-processor]
    cd classical-Chinese-processor
-   python3 cc-prox.py document.pdf --output ./processed
     ```
-   
-4. **Set up API keys**
+3. **Set up API keys**
     ```bash
    export DASHSCOPE_API_KEY="your_alibaba_key"
    export KIMI_API_KEY="your_moonshot_key"
+    ```
+   (replace "export" with "set" on PC)
+5. **Run the script**
+    ```bash
+     python3 cc-prox.py document.pdf --output ./processed
     ```
 
 COMMANDS (Run these in terminal afer the script name)

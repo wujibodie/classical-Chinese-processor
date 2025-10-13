@@ -42,7 +42,7 @@ COMMANDS (Run these in terminal afer the script name)
 - output: choose output directory
 - batch: process all files in a directory (replace input w/ this)
 - dpi: choose DPI for PDF conversion (default is 200)
-- model: choose Qwen model, default is qwen-vl-max, but qwen-vl-plus performs ok and half the price.
+- model: choose Qwen model, default is qwen-vl-max, but qwen-vl-plus is a cheaper (ime less accurate) option.
 - max-pages: limit processing to first N pages
 - start-page: start processing from page N
 - resume-from: start processing from raw OCR JSON file (in case a run was interrupted).

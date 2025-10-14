@@ -38,6 +38,7 @@ SETUP
     ```
 
 COMMANDS (Run these in terminal afer the script name)
+
 (Example: python3 cc-prox.py document.pdf --context "明代地方志" --output ./results)
 - context "xx": Passes contextual info to LLMs
 - output: choose output directory
@@ -49,6 +50,7 @@ COMMANDS (Run these in terminal afer the script name)
 - resume-from: start processing from raw OCR JSON file (in case a run was interrupted).
 
 TROUBLESHOOTING
+
 "No API keys found":
 - Make sure you set the environment variables
 - Restart your terminal after setting them

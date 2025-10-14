@@ -3,7 +3,8 @@ It does this by leveraging the current best OCR engine for classical Chinese, Qw
 
 The full process is: input PDF -> PDF is split into single page PNGs -> send to Qwen-vl-max for OCR -> output raw OCR as one combined file -> chunk raw output into manageable blocks -> send to Kimi K2 for editing -> recombine Kimi's output into a single .md file and export.
 
-The price of the whole process averages around $0.01 per page, and the final results are better than you'll generally find anywhere else for obscure texts, if your scan is good quality.
+The price of the whole process averages around $0.01 per page, and the final results are better than you'll generally find anywhere else for obscure texts, if your scan is good quality. It won't give 100% accurate results, but it normally hits 90+% of characters correct in my tests.
+
 In general it takes around 30s-1m per page, so a full book will run for a few hours. The log will let you know how things are going and roughly how long everything is taking. It's normally safe to leave it until it finishes, but you might want to check if any errors pop up. 
 
 There are various commands listed below to change how it processes your file(s). You can also poke around in the configs inside the .py.

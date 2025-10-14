@@ -53,7 +53,7 @@ COMMANDS (Run these in terminal afer the script name)
 TROUBLESHOOTING
 
 "No API keys found":
-- Make sure you set the environment variables
+- Make sure you set the environment variables　（your API keys)
 - Restart your terminal after setting them
 
 "No images were converted":

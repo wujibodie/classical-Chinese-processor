@@ -3,7 +3,7 @@ It does this by leveraging the current best OCR engine for classical Chinese, Qw
 
 The full process is: input PDF -> PDF is split into single page PNGs -> send to Qwen-vl-max for OCR -> output raw OCR as one combined file -> chunk raw output into manageable blocks -> send to Kimi K2 for editing -> recombine Kimi's output into a single .md file and export.
 
-The price of the whole process averages around $0.01 per page, and the final results are better than you'll generally find anywhere else for obscure texts, if your scan is good quality. It won't give 100% accurate results, but it normally hits 90+% of characters correct in my tests.
+The price of the whole process averages around $0.01 per page, and the final results are better than you'll generally find anywhere else for obscure texts, if your scan is good quality. It won't give 100% accurate results, but it normally hits 90+% of characters correct in my tests. This is generally high enough for the full context to be clear, although you'll want to double check sections that are important to you against the original scan. Also, it is possible for whole chunks of text to get corrupted or lost, but this is rare unless the scanned text is in an unusual format or somehow damaged. In such cases the damage is normally limited to single pages or less.
 
 In general it takes around 30s-1m per page, so a full book will run for a few hours. The log will let you know how things are going and roughly how long everything is taking. It's normally safe to leave it until it finishes, but you might want to check if any errors pop up. 
 
@@ -11,21 +11,20 @@ There are various commands listed below to change how it processes your file(s).
 
 YOU WILL NEED
 1. AliCloud and Moonshot API keys, as well as sufficient funds to use them.
-     - If you don't have these, go [here]([url](https://www.alibabacloud.com/help/en/model-studio/get-api-key)) and here (https://platform.moonshot.ai/docs/overview) and           follow the steps. Note that for Qwen, you have the choice between a Chinese or international API key. The Chinese key will be cheaper, but requires a Chinese phone         number and ID verification. The script is set up for Alicloud's international servers, but you can easily adjust it to the Chinese version. Moonshot doesn't                distinguish and also won't require ID verification.
+     - If you don't have these, go [here]([url](https://www.alibabacloud.com/help/en/model-studio/get-api-key)) and here (https://platform.moonshot.ai/docs/overview) and follow the steps. Note that for Qwen, you have the choice between a Chinese or international API key. The Chinese key will be cheaper, but requires a Chinese phone         number and ID verification. The script is set up for Alicloud's international servers, but you can easily adjust it to the Chinese version. Moonshot doesn't                distinguish and also won't require ID verification.
 3. Basic familiarity with running python scripts in terminal.
-     - Make sure you have Python installed, as well as all necessary dependencies: pdf2image, openai, and requests. Non-Windows users may           need to separately install Poppler as well (it installs with Pdf2Image on PC)
+     - Make sure you have Python installed, as well as all necessary dependencies: pdf2image, openai, and requests. Non-Windows users may need to separately install Poppler as well (it installs with Pdf2Image on PC)
 4. A GOOD PDF scan of your document. If Qwen can't make any sense of your document (at least ~75-80% accurate) things will break down.
    - If you want to test it, you can upload 1-5 pages of your PDF (converted) in a chat with the OCR-bot here:           https://modelstudio.console.alibabacloud.com/?tab=dashboard#/efm/prompt?modelId=qwen-vl-max
    - There are several processes built in to clean up OCR mistakes, but the bulk of the text needs to be usable for those to work.
   
 SETUP
 
-1. **Install Python** (if you don't have it):
-2. **Install this script**:
+1. **Install Python** (if you don't have it).
+2. **Install this script and necessary packages**:
     ```bash
     pip install pdf2image opencv-python openai requests
    git clone [https://github.com/wujibodie/classical-Chinese-processor]
-   cd classical-Chinese-processor
     ```
 3. **Set up API keys**
     ```bash

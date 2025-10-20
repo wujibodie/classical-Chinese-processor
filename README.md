@@ -1,5 +1,5 @@
 This is a simple script that turns PDF scans of Ming-Qing era Classical Chinese documents into clean, readable, searchable markdown files (easy to convert to any kind of text file). 
-It does this by leveraging the current best OCR engine for classical Chinese, Qwen-vl-max, with specific instructions suitable for left-right, vertical column printed text. The raw OCR output is polished by another model, Kimi K2 (you can configure it to use DeepSeek easily as well).
+It does this by leveraging the current best OCR engine for classical Chinese, Qwen-vl-max, with specific instructions suitable for right-left, vertical column printed text. The raw OCR output is polished by another model, Kimi K2 (you can configure it to use DeepSeek easily as well).
 
 The full process is: input PDF -> PDF is split into single page PNGs -> send to Qwen-vl-max for OCR -> output raw OCR as one combined file -> chunk raw output into manageable blocks -> send to Kimi K2 for editing -> recombine Kimi's output into a single .md file and export.
 

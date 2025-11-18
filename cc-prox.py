@@ -45,7 +45,6 @@ except ImportError:
 @dataclass
 class ProcessingConfig:
     """Centralized configuration for document processing"""
-
     # OCR Settings
     ocr_dpi: int = 200
     qwen_model: str = "qwen-vl-max"
@@ -54,10 +53,10 @@ class ProcessingConfig:
     # OCR Quality Thresholds
     expected_chars_normal: int = 500   # Flag if above this
     ocr_soft_cap: int = 800           # Warn if above this
-    ocr_hard_cap: int = 1000          # Truncate if above this
+    ocr_hard_cap: int = 1200          # Truncate if above this
 
     # Text Processing Settings
-    max_text_length: int = 2000
+    max_text_length: int = 2400
     chunk_overlap: int = 400
     api_timeout: int = 300
     retry_attempts: int = 3
@@ -166,7 +165,7 @@ class TextProcessor:
             r'---\s*\n\*\*改写说明\*\*.*?(?=---|\Z)',
             r'〔改写说明〕.*?〔/改写说明〕',
             r'〔润色说明〕.*?〔/润色说明〕',
-            r'注：.*', r'说明：.*',
+            r'\n注：.*', r'\n说明：.*',
         ]
 
         for pattern in patterns:
@@ -247,69 +246,144 @@ class ImageProcessor:
         return text[:max_length]
 
 # ============================================================================
-# PDF PROCESSING
+# ZOTERO INTEGRATION
 # ============================================================================
 
-class PDFProcessor:
-    """Handles PDF conversion and page management"""
-
+class ZoteroExporter:
+    """Handles exporting to Zotero"""
+    
     @staticmethod
-    def get_page_count(pdf_path: str) -> int:
-        """Get number of pages in PDF"""
-        if not PDF_SUPPORT:
-            raise Exception("PDF support not available")
-        info = pdfinfo_from_path(pdf_path)
-        return info["Pages"]
-
-    @staticmethod
-    def convert_to_images_batch(pdf_path: str, config: ProcessingConfig,
-                               start_page: int = 1, end_page: Optional[int] = None,
-                               batch_size: int = 5) -> List[Tuple[int, str]]:
-        """Convert PDF pages to images in batches"""
-        if not PDF_SUPPORT:
-            raise Exception("PDF support not available")
-
-        info = pdfinfo_from_path(pdf_path)
-        total_pages_in_pdf = info["Pages"]
-        actual_end_page = end_page if end_page else total_pages_in_pdf
+    def get_collection_key(collection_name: str) -> Optional[str]:
+        """Look up Zotero collection key by name"""
+        api_key = os.getenv("ZOTERO_API_KEY")
+        user_id = os.getenv("ZOTERO_USER_ID")
         
-        print(f"🔍 PDF has {total_pages_in_pdf} total pages")
-        print(f"🔍 Converting pages {start_page} to {actual_end_page}")
-        temp_files = []
-
-        for batch_start in range(start_page, actual_end_page + 1, batch_size):
-            batch_end = min(batch_start + batch_size - 1, actual_end_page)
-            try:
-                images = convert_from_path(
-                    pdf_path,
-                    dpi=config.ocr_dpi,
-                    first_page=batch_start,
-                    last_page=batch_end
+        if not api_key or not user_id:
+            return None
+        
+        try:
+            headers = {"Zotero-API-Key": api_key}
+            response = requests.get(
+                f"https://api.zotero.org/users/{user_id}/collections",
+                headers=headers
+            )
+            
+            if response.status_code != 200:
+                return None
+            
+            collections = response.json()
+            for collection in collections:
+                if collection['data']['name'] == collection_name:
+                    return collection['data']['key']
+            
+            print(f"⚠️  Collection '{collection_name}' not found in Zotero library")
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error looking up collection: {e}")
+            return None
+    
+    @staticmethod
+    def export_to_zotero(markdown_path: Path, source_file: str,
+                        qwen_model: str, pages_processed: int,
+                        title: Optional[str] = None,
+                        collection_key: Optional[str] = None) -> Optional[str]:
+        """
+        Export processed text to Zotero library with metadata and markdown attachment
+        
+        Returns:
+            Zotero item key on success, None on failure
+        """
+        api_key = os.getenv("ZOTERO_API_KEY")
+        user_id = os.getenv("ZOTERO_USER_ID")
+        
+        if not api_key or not user_id:
+            print("⚠️  Warning: ZOTERO_API_KEY or ZOTERO_USER_ID not set. Skipping Zotero export.")
+            return None
+        
+        try:
+            # Prepare metadata
+            source_name = Path(source_file).stem
+            display_title = title if title else source_name
+            process_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # Create Zotero item
+            item_data = {
+                "itemType": "book",
+                "title": display_title,
+                "abstractNote": f"OCR-processed classical Chinese text from {Path(source_file).name}",
+                "date": process_date,
+                "language": "zh",
+                "extra": (
+                    f"OCR Engine: Qwen-VL ({qwen_model})\n"
+                    f"Source File: {Path(source_file).name}\n"
+                    f"Pages Processed: {pages_processed}\n"
+                    f"Processing Date: {process_date}"
                 )
-                
-                for i, img in enumerate(images):
-                    temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-                    img.save(temp_file.name, 'PNG')
-                    actual_page_num = batch_start + i
-                    temp_files.append((actual_page_num, temp_file.name))
-            except Exception as e:
-                print(f"Error converting batch {batch_start}-{batch_end}: {e}")
-                import traceback
-                traceback.print_exc()
-
-        return temp_files
+            }
+            
+            # Add to collection if specified
+            if collection_key:
+                item_data["collections"] = [collection_key]
+            
+            # Create item in Zotero
+            headers = {
+                "Zotero-API-Key": api_key,
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(
+                f"https://api.zotero.org/users/{user_id}/items",
+                headers=headers,
+                json=[item_data]
+            )
+            
+            if response.status_code != 200:
+                print(f"❌ Failed to create Zotero item: {response.status_code}")
+                print(response.text)
+                return None
+            
+            # Get the created item key
+            item_key = response.json()['successful']['0']['key']
+            print(f"✓ Created Zotero item: {item_key}")
+            
+            # Attach markdown file
+            with open(markdown_path, 'rb') as f:
+                file_content = f.read()
+            
+            attachment_response = requests.post(
+                f"https://api.zotero.org/users/{user_id}/items/{item_key}/file",
+                headers={
+                    "Zotero-API-Key": api_key,
+                    "Content-Type": "text/markdown",
+                    "If-None-Match": "*"
+                },
+                data=file_content
+            )
+            
+            if attachment_response.status_code == 200:
+                print(f"✓ Attached markdown file to Zotero item")
+            else:
+                print(f"⚠️  Warning: Failed to attach file: {attachment_response.status_code}")
+            
+            return item_key
+            
+        except Exception as e:
+            print(f"❌ Error exporting to Zotero: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 # ============================================================================
 # OCR ENGINE
 # ============================================================================
 
 class OCREngine:
-    """Handles OCR operations using Qwen-VL"""
+    """Handles Qwen-VL OCR operations"""
 
     def __init__(self, clients: APIClients, config: ProcessingConfig):
         self.clients = clients
         self.config = config
-        self.image_processor = ImageProcessor()
         self.text_processor = TextProcessor()
 
     def process_image(self, image_path: str, page_num: int, total_pages: int) -> Optional[Tuple[str, bool]]:
@@ -317,95 +391,109 @@ class OCREngine:
         progress = f"({page_num}/{total_pages}, {page_num*100//total_pages}%)" if total_pages > 1 else ""
         print(f"\n--- Page {page_num} {progress} ---")
 
+        # Preprocess image
+        processed_path = ImageProcessor.preprocess_image(image_path, self.config)
+        temp_preprocessed = processed_path if processed_path != image_path else None
+
         try:
-            # Preprocess image
-            processed_path = self.image_processor.preprocess_image(image_path, self.config)
-            temp_preprocessed = processed_path if processed_path != image_path else None
+            # Read and encode image as base64
+            with open(processed_path, 'rb') as image_file:
+                image_content = base64.b64encode(image_file.read()).decode('utf-8')
 
-            try:
-                # Read and encode image as base64
-                with open(processed_path, 'rb') as image_file:
-                    image_content = base64.b64encode(image_file.read()).decode('utf-8')
+            # API call with retry logic
+            text = None
+            for attempt in range(self.config.retry_attempts):
+                try:
+                    response = self.clients.qwen.chat.completions.create(
+                        model=self.config.qwen_model,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                       "你是一个古典文献OCR专家。请严格按以下要求提取图片中的全部中文文字:\n"
+                                        "1. 版面格式:传统竖排版式,从右到左、从上到下阅读\n"
+                                        "2. 每列约1-25字,完整提取每一列\n"
+                                        "3. 保留所有标点、空格和换行\n"
+                                        "4. 忽略页码、印章、水印、图书馆标记等元数据。若页面文字内容少于10个字符，或主要区域为图画/图表，输出'[图]。若页面完全无文字内容，或仅有仅有页码/图书馆标记，输出'[空页]'\n"
+                                        "5. 如果遇到模糊或破损文字,用【?】标注\n"
+                                        "6. 只提取页面主体文字区域,忽略装订边和页边距\n"
+                                        "7. 输出纯文本,不要添加任何说明或标题\n"
+                                        "8. 特殊格式处理： 如遇表格、名册、账目等行列对齐的版式，请优先保持其行列结构。可使用换行和空格来区分不同条目，确保同一行的数据保持在同一行\n"
+                                        "9. 严格保持原文用字：如原文为繁体字，输出一律使用繁体；仅当原文确为简化字时方用简体"
+                                        "\n请开始提取:"
+                                    )
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{image_content}"}
+                                }
+                            ]
+                        }],
+                        max_tokens=4096,
+                        temperature=0.1,
+                        timeout=self.config.api_timeout
+                    )
+                    
+                    text = response.choices[0].message.content.strip()
+                    break  # Success, exit retry loop
+                    
+                except Exception as e:
+                    if attempt < self.config.retry_attempts - 1:
+                        wait_time = self.config.retry_delay * (2 ** attempt)
+                        print(f"  ⚠️  OCR error (attempt {attempt+1}/{self.config.retry_attempts}): {e}")
+                        print(f"  Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  ❌ All OCR retry attempts failed: {e}")
+                        return None
 
-                # Send to Qwen-VL API for OCR
-                response = self.clients.qwen.chat.completions.create(
-                    model=self.config.qwen_model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                   "你是一个古典文献OCR专家。请严格按以下要求提取图片中的全部中文文字:\n"
-                                    "1. 版面格式:传统竖排版式,从右到左、从上到下阅读\n"
-                                    "2. 每列约1-25字,完整提取每一列\n"
-                                    "3. 保留所有标点、空格和换行\n"
-                                    "4. 忽略页码、印章、水印、图书馆标记等元数据\n"
-                                    "5. 如果遇到模糊或破损文字,用【?】标注\n"
-                                    "6. 只提取页面主体文字区域,忽略装订边和页边距\n"
-                                    "7. 输出纯文本,不要添加任何说明或标题\n"
-                                    "\n请开始提取:"
-                                )
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_content}"}
-                            }
-                        ]
-                    }],
-                    max_tokens=4096,
-                    temperature=0.1
-                )
+            if text is None:
+                return None
 
-                text = response.choices[0].message.content.strip()
-                char_count = len(text)
+            char_count = len(text)
 
-                # Progressive quality checks with our agreed thresholds
-                if char_count > self.config.expected_chars_normal:
-                    print(f"  ⚠️  Long page: {char_count} chars (expected <{self.config.expected_chars_normal})")
+            # Progressive quality checks with our agreed thresholds
+            if char_count > self.config.expected_chars_normal:
+                print(f"  ⚠️  Long page: {char_count} chars (expected <{self.config.expected_chars_normal})")
 
-                if char_count > self.config.ocr_soft_cap:
-                    print(f"  ⚠️  Very long page: {char_count} chars (soft cap: {self.config.ocr_soft_cap})")
+            if char_count > self.config.ocr_soft_cap:
+                print(f"  ⚠️  Very long page: {char_count} chars (soft cap: {self.config.ocr_soft_cap})")
 
-                if char_count > self.config.ocr_hard_cap:
-                    print(f"  🔴 Excessive length: {char_count} chars - truncating to {self.config.ocr_hard_cap}")
-                    text = text[:self.config.ocr_hard_cap]
+            if char_count > self.config.ocr_hard_cap:
+                print(f"  🔴 Excessive length: {char_count} chars - truncating to {self.config.ocr_hard_cap}")
+                text = text[:self.config.ocr_hard_cap]
 
-                # Detect loops and first pass truncation
-                has_loops = self.text_processor.detect_ocr_loops_simple(text)
+            # Detect loops and first pass truncation
+            has_loops = self.text_processor.detect_ocr_loops_simple(text)
 
-                if has_loops:
-                    print(f"  🔄 Potential OCR loops detected - truncating aggressively")
-                    # Find first major repetition and cut there
-                    text = ImageProcessor.truncate_at_loop(text, max_length=800)
+            if has_loops:
+                print(f"  🔄 Potential OCR loops detected - truncating aggressively")
+                # Find first major repetition and cut there
+                text = ImageProcessor.truncate_at_loop(text, max_length=800)
 
-                print(f"  ✓ OCR success ({len(text)} chars{', has loops' if has_loops else ''})")
+            print(f"  ✓ OCR success ({len(text)} chars{', has loops' if has_loops else ''})")
 
-                # Remove library metadata
-                cleaned_text = self.text_processor.remove_metadata_text(text)
+            # Remove library metadata
+            cleaned_text = self.text_processor.remove_metadata_text(text)
 
-                return cleaned_text, has_loops
+            return cleaned_text, has_loops
 
-            finally:
-                # Clean up temporary preprocessed image
-                if temp_preprocessed and os.path.exists(temp_preprocessed):
-                    try:
-                        os.unlink(temp_preprocessed)
-                    except:
-                        pass
-
-        except Exception as e:
-            print(f"  ❌ OCR error: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        finally:
+            # Clean up temporary preprocessed image
+            if temp_preprocessed and os.path.exists(temp_preprocessed):
+                try:
+                    os.unlink(temp_preprocessed)
+                except:
+                    pass
 
 # ============================================================================
 # TEXT CLEANING ENGINE
 # ============================================================================
 
 class TextCleaner:
-    """Handles text cleaning using Kimi"""
+    """Handles Kimi text cleaning operations"""
 
     def __init__(self, clients: APIClients, config: ProcessingConfig):
         self.clients = clients
@@ -415,13 +503,11 @@ class TextCleaner:
     def clean_chunk(self, text_chunk: str, context: str = "", has_ocr_loops: bool = False) -> str:
         """Clean a single chunk of text with retry logic"""
         start_time = time.time()
-
         loop_warning = ""
         if has_ocr_loops:
             loop_warning = "\n\n**重要提示**：此文本可能包含OCR识别循环导致的重复内容，请仔细检查并删除所有重复部分。"
 
         prompt = f"""请将以下OCR文本整理成连贯的文言文文献。这是明清时期的文集。
-
 要求：
 1. 修正明显的OCR识别错误（形近字误认等）
 2. 添加适当的标点符号（句号、逗号等）使其可读
@@ -463,131 +549,87 @@ OCR文本：
 
         return text_chunk
 
-    def clean_document_sequential(self, combined_text: str, context: str = "", has_ocr_loops: bool = False) -> str:
-        """Clean entire document by processing chunks sequentially"""
-        print(f"  [2/3] Cleaning {len(combined_text)} characters sequentially...")
-
-        # Split into chunks
-        chunks = self._split_into_chunks(combined_text)
-        print(f"  Split into {len(chunks)} chunks for sequential cleaning...")
-
-        # Process chunks
-        cleaned_chunks = []
-        total_start_time = time.time()
-
-        for i, chunk in enumerate(chunks, 1):
-            chunk_start = time.time()
-            print(f"    Processing chunk {i}/{len(chunks)} ({len(chunk)} chars)... ", end='')
-
-            try:
-                cleaned = self.clean_chunk(chunk, context, has_ocr_loops)
-                cleaned = self.text_processor.remove_explanatory_text(cleaned)
-                cleaned_chunks.append(cleaned)
-
-                chunk_time = time.time() - chunk_start
-                print(f"✓ ({chunk_time:.1f}s)")
-
-                # Progress update
-                if i % 10 == 0:
-                    elapsed = time.time() - total_start_time
-                    avg_time = elapsed / i
-                    remaining = (len(chunks) - i) * avg_time
-                    eta_mins = remaining / 60
-                    print(f"    📊 Progress: {i}/{len(chunks)} ({i*100//len(chunks)}%) - ETA: {eta_mins:.1f} minutes")
-
-                # Rate limiting
-                if i < len(chunks):
-                    time.sleep(1)
-
-            except Exception as e:
-                print(f"✗ Failed: {e}")
-                cleaned_chunks.append(chunk)
-                time.sleep(2)
-
-        total_time = time.time() - total_start_time
-        print(f"  ✓ All {len(chunks)} chunks cleaned in {total_time/60:.1f} minutes!")
-
-        return '\n\n'.join(cleaned_chunks)
-
-    def _split_into_chunks(self, text: str) -> List[str]:
-        """Split text into manageable chunks with overlap"""
+    def create_chunks_with_overlap(self, text: str) -> List[Tuple[str, int, int]]:
+        """Create overlapping chunks for processing"""
         chunks = []
         start = 0
 
         while start < len(text):
-            end = start + self.config.max_text_length
-
-            # Try to break at natural boundaries
-            if end < len(text):
-                for break_point in ['\n\n', '。', '；', '！', '？', '\n']:
-                    last_break = text.rfind(break_point, start + self.config.max_text_length//2, end)
-                    if last_break != -1:
-                        end = last_break + len(break_point)
-                        break
-
+            end = min(start + self.config.max_text_length, len(text))
             chunk = text[start:end]
-            chunks.append(chunk)
-            start = end - self.config.chunk_overlap if end < len(text) else end
+            chunks.append((chunk, start, end))
+            start = end - self.config.chunk_overlap
 
+        print(f"Created {len(chunks)} chunks with {self.config.chunk_overlap}-char overlap")
         return chunks
 
+    def process_text_in_chunks(self, text: str, context: str = "", has_ocr_loops: bool = False) -> str:
+        """Process text in chunks with overlap"""
+        if len(text) <= self.config.max_text_length:
+            print("Processing single chunk...", end=' ')
+            return self.clean_chunk(text, context, has_ocr_loops)
+
+        print(f"\nText length: {len(text)} chars")
+        chunks = self.create_chunks_with_overlap(text)
+        cleaned_chunks = []
+
+        for i, (chunk, start, end) in enumerate(chunks, 1):
+            print(f"\nProcessing chunk {i}/{len(chunks)} (chars {start}-{end})...", end=' ')
+            cleaned = self.clean_chunk(chunk, context, has_ocr_loops)
+            cleaned_chunks.append(cleaned)
+
+        combined = '\n\n'.join(cleaned_chunks)
+        print(f"\n✓ Combined all chunks into {len(combined)} chars")
+        return combined
+
+    def final_polish(self, text: str, context: str = "") -> str:
+        """Final polish pass on the complete text"""
+        print("\n=== Final Polish Pass ===")
+        prompt = f"""请对以下已整理的文言文进行最终润色。这是明清时期的文献。
+
+要求：
+1. 移除Kimi可能添加的任何说明性文字（如"改写说明"、"润色说明"等）
+2. 修正剩余的明显错误
+3. 确保标点符号正确且一致
+4. 确保段落之间有适当的连贯性
+5. 删除任何重复的段落或文本块
+6. 保持原文的古汉语特征
+7. **不要添加任何新的说明、标题或元数据**
+8. **直接输出润色后的正文，不要有任何前言或后记**
+
+{f"上下文提示：{context}" if context else ""}
+
+文本：
+{text}
+
+请直接输出润色后的完整文本："""
+
+        for attempt in range(self.config.retry_attempts):
+            try:
+                response = self.clients.kimi.chat.completions.create(
+                    model="kimi-k2-0905-preview",
+                    messages=[{"role": "user", "content": prompt}],
+                    timeout=self.config.api_timeout,
+                    max_tokens=4096
+                )
+                polished = response.choices[0].message.content
+                print("✓ Final polish complete")
+                return self.text_processor.remove_explanatory_text(polished)
+
+            except Exception as e:
+                print(f"✗ Polish error (attempt {attempt+1}/{self.config.retry_attempts}): {e}")
+                if attempt < self.config.retry_attempts - 1:
+                    wait_time = self.config.retry_delay * (2 ** attempt)
+                    print(f"    Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print("    All retry attempts failed. Returning unpolished text.")
+                    return text
+
+        return text
+
 # ============================================================================
-# BACKUP MANAGEMENT
-# ============================================================================
-
-class BackupManager:
-    """Handles OCR backup creation and validation"""
-
-    @staticmethod
-    def save_raw_ocr(document_name: str, all_raw_texts: List[str],
-                    pages_with_loops: List[int], output_dir: str) -> Path:
-        """Save raw OCR results to JSON file"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ocr_backup_path = Path(output_dir) / f"{document_name}_raw_ocr_{timestamp}.json"
-        latest_path = Path(output_dir) / f"{document_name}_raw_ocr_latest.json"
-
-        backup_data = {
-            "document_name": document_name,
-            "total_pages": len(all_raw_texts),
-            "total_characters": sum(len(text) for text in all_raw_texts),
-            "pages_with_loops": pages_with_loops,
-            "timestamp": datetime.now().isoformat(),
-            "pages": all_raw_texts
-        }
-
-        # Save both versions
-        for path in [ocr_backup_path, latest_path]:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(backup_data, f, ensure_ascii=False, indent=2)
-
-        print(f"✓ Raw OCR backup saved: {ocr_backup_path}")
-        return ocr_backup_path
-
-    @staticmethod
-    def validate_backup(backup_path: Path) -> bool:
-        """Validate OCR backup file"""
-        try:
-            with open(backup_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            required_fields = ["document_name", "pages", "total_pages", "timestamp"]
-            missing = [field for field in required_fields if field not in data]
-
-            if missing:
-                print(f"❌ Invalid backup file: missing {missing}")
-                return False
-
-            if not data["pages"]:
-                print("❌ Backup file contains no page data")
-                return False
-
-            return True
-        except Exception as e:
-            print(f"❌ Error validating backup file: {e}")
-            return False
-
-# ============================================================================
-# DOCUMENT PROCESSOR (Main Orchestrator)
+# DOCUMENT PROCESSOR
 # ============================================================================
 
 class DocumentProcessor:
@@ -598,250 +640,277 @@ class DocumentProcessor:
         self.clients = APIClients()
         self.ocr_engine = OCREngine(self.clients, config)
         self.text_cleaner = TextCleaner(self.clients, config)
-        self.pdf_processor = PDFProcessor()
-        self.backup_manager = BackupManager()
+        self.zotero = ZoteroExporter()
 
-    def process_pdf(self, pdf_path: str, translate: bool = False, context: str = "",
-               output_dir: str = "./processed", quick_mode: bool = False,
-               max_pages: Optional[int] = None, start_page: int = 1) -> Optional[Path]:
-        """Process a PDF document"""
+    def process_image(self, image_path: str, context: str = "",
+                     output_dir: str = "./processed",
+                     quick_mode: bool = False) -> Optional[Path]:
+        """Process a single image file"""
+        print(f"\n{'='*60}")
+        print(f"Processing image: {image_path}")
+        print(f"{'='*60}")
+
+        # OCR
+        result = self.ocr_engine.process_image(image_path, 1, 1)
+        if not result:
+            print("❌ OCR failed")
+            return None
+
+        raw_text, has_loops = result
+
+        # Save raw OCR
+        os.makedirs(output_dir, exist_ok=True)
+        doc_name = Path(image_path).stem
+
+        # Clean text
+        print("\n=== Text Cleaning Stage ===")
+        cleaned_text = self.text_cleaner.process_text_in_chunks(raw_text, context, has_loops)
+
+        # Final polish
+        if not quick_mode:
+            cleaned_text = self.text_cleaner.final_polish(cleaned_text, context)
+
+        # Create consolidated note
+        pages_with_loops = [1] if has_loops else []
+
+        output_path = self._create_consolidated_note(
+            doc_name, cleaned_text, pages_with_loops,
+            output_dir, context, 1
+        )
+
+        print(f"\n✓ Processing complete: {output_path}")
+        return output_path
+
+    def process_pdf(self, pdf_path: str, context: str = "",
+                   output_dir: str = "./processed",
+                   quick_mode: bool = False, max_pages: Optional[int] = None,
+                   start_page: int = 1,
+                   export_zotero: bool = False,
+                   zotero_title: Optional[str] = None,
+                   zotero_collection: Optional[str] = None) -> Optional[Path]:
+        """Process a PDF file"""
         print(f"\n{'='*60}")
         print(f"Processing PDF: {pdf_path}")
-        if quick_mode:
-            print(f"Mode: QUICK (skipping final polish)")
-        if max_pages:
-            print(f"Limiting to {max_pages} pages starting from page {start_page}")
+        print(f"Output directory: {output_dir}")
+        print(f"{'='*60}")
+
+        if not PDF_SUPPORT:
+            print("❌ PDF support not available")
+            return None
 
         try:
-            # Get page count
-            total_pages = self.pdf_processor.get_page_count(pdf_path)
-            
-            # Calculate actual page range
-            if max_pages:
-                # Process max_pages starting from start_page
-                end_page = min(start_page + max_pages - 1, total_pages)
-            else:
-                end_page = total_pages
-
+            # Get page info
+            info = pdfinfo_from_path(pdf_path)
+            total_pages = info["Pages"]
+            end_page = min(start_page + max_pages - 1, total_pages) if max_pages else total_pages
             page_count = end_page - start_page + 1
 
-            if page_count <= 0:
-                print(f"❌ Error: Invalid page range")
-                return None
+            print(f"Total PDF pages: {total_pages}")
+            print(f"Processing pages {start_page} to {end_page} ({page_count} pages)")
+            print(f"DPI: {self.config.ocr_dpi}, Model: {self.config.qwen_model}")
 
-            print(f"Processing pages {start_page}-{end_page} ({page_count} page(s))")
-            print(f"{'='*60}")
+            # Create output directory
+            os.makedirs(output_dir, exist_ok=True)
+            doc_name = Path(pdf_path).stem
 
+            # OCR Stage
+            print("\n" + "="*60)
+            print("STAGE 1: OCR EXTRACTION")
+            print("="*60)
+
+            all_ocr_texts = []
+            pages_with_loops = []
             start_time = time.time()
 
-            # Step 1: OCR all pages
-            print("\n[1/3] Performing OCR on all pages...")
-            all_raw_texts = []
-            pages_with_loops = []
+            for page_num in range(start_page, end_page + 1):
+                # Convert single page
+                images = convert_from_path(
+                    pdf_path,
+                    dpi=self.config.ocr_dpi,
+                    first_page=page_num,
+                    last_page=page_num
+                )
 
-            # FIXED: Pass end_page instead of max_pages
-            temp_files = self.pdf_processor.convert_to_images_batch(
-                pdf_path, self.config, start_page=start_page, end_page=end_page, batch_size=5
-            )
+                if not images:
+                    print(f"⚠️  Skipping page {page_num} - conversion failed")
+                    continue
 
-            if not temp_files:
-                print("❌ No images were converted from PDF")
-                return None
+                # Save as temporary image
+                temp_image = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                images[0].save(temp_image.name, 'PNG')
 
-            for page_num, img_path in temp_files:
-                page_start = time.time()
                 try:
-                    result = self.ocr_engine.process_image(img_path, page_num, page_count)
+                    # Process with OCR
+                    result = self.ocr_engine.process_image(temp_image.name, page_num, page_count)
                     if result:
                         text, has_loops = result
-                        if text and text.strip():
-                            all_raw_texts.append(text.strip())
-                            if has_loops:
-                                pages_with_loops.append(page_num)
-                            page_time = time.time() - page_start
-                            print(f"✓ Page {page_num} OCR complete ({page_time:.1f}s)")
-                        else:
-                            print(f"⚠️  Page {page_num} had no usable text")
-                    else:
-                        print(f"⚠️  Page {page_num} processing failed")
+                        all_ocr_texts.append(text)
+                        if has_loops:
+                            pages_with_loops.append(page_num)
                 finally:
-                    if img_path and os.path.exists(img_path):
-                        try:
-                            os.unlink(img_path)
-                        except:
-                            pass
+                    # Clean up temp image
+                    if os.path.exists(temp_image.name):
+                        os.unlink(temp_image.name)
 
-            # Save backup
-            os.makedirs(output_dir, exist_ok=True)
-            document_name = Path(pdf_path).stem
-            if start_page > 1 or end_page < total_pages:
-                document_name = f"{document_name}_p{start_page}-{end_page}"
+            ocr_time = time.time() - start_time
 
-            backup_path = self.backup_manager.save_raw_ocr(
-                document_name, all_raw_texts, pages_with_loops, output_dir
-            )
-
-            # OCR Summary
-            print(f"\n📊 OCR SUMMARY:")
-            print(f"  Total pages processed: {len(all_raw_texts)}")
-            print(f"  Total characters: {sum(len(text) for text in all_raw_texts)}")
-            if pages_with_loops:
-                print(f"  🔄 Pages with potential loops: {len(pages_with_loops)}")
-                print(f"     {pages_with_loops[:10]}")
-                if len(pages_with_loops) > 10:
-                    print(f"     ...and {len(pages_with_loops)-10} more")
-
-            if not all_raw_texts:
-                print("✗ No pages were successfully processed")
+            if not all_ocr_texts:
+                print("❌ No text extracted from any pages")
                 return None
 
-            # Step 2: Clean document
-            print(f"\n[2/3] Combining {len(all_raw_texts)} pages and cleaning...")
-            combined_raw = '\n\n'.join(all_raw_texts)
+            # Combine OCR texts
+            combined_ocr = '\n\n'.join(all_ocr_texts)
+            print(f"\n✓ OCR complete: {len(combined_ocr)} chars from {len(all_ocr_texts)} pages")
+            print(f"   Time: {ocr_time:.1f}s")
+            print(f"   Pages with loops: {len(pages_with_loops)}")
 
-            # Pass loop flag to cleaning
-            has_any_loops = len(pages_with_loops) > 0
-            cleaned_text = self.text_cleaner.clean_document_sequential(combined_raw, context, has_any_loops)
-            final_text = cleaned_text
+            # Save OCR backup
+            backup_data = {
+                "document": doc_name,
+                "source": str(pdf_path),
+                "pages_processed": page_count,
+                "pages_with_loops": pages_with_loops,
+                "raw_ocr_text": combined_ocr,
+                "context": context,
+                "timestamp": datetime.now().isoformat(),
+                "config": {
+                    "model": self.config.qwen_model,
+                    "dpi": self.config.ocr_dpi,
+                }
+            }
 
-            # Step 3: Optional translation
-            translation = None
-            if translate:
-                print(f"\n[3/3] Translating entire document...")
-                translation = self._translate_document(final_text)
+            backup_path = Path(output_dir) / f"{doc_name}_raw_ocr_latest.json"
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            print(f"   Backup saved: {backup_path}")
 
-            # Create output
-            note_path = self._create_consolidated_note(
-                document_name, final_text, translation, pages_with_loops,
-                output_dir, context, len(all_raw_texts)
+            # Cleaning Stage
+            print("\n" + "="*60)
+            print("STAGE 2: TEXT CLEANING")
+            print("="*60)
+
+            has_loops = len(pages_with_loops) > 0
+            cleaned_text = self.text_cleaner.process_text_in_chunks(
+                combined_ocr, context, has_loops
             )
 
-            # Final summary
-            successful = len(all_raw_texts)
+            # Final polish
+            if not quick_mode:
+                cleaned_text = self.text_cleaner.final_polish(cleaned_text, context)
+
+            # Create consolidated note
+            output_path = self._create_consolidated_note(
+                doc_name, cleaned_text, pages_with_loops,
+                output_dir, context, page_count
+            )
+
             total_time = time.time() - start_time
-            avg_time = total_time / successful if successful > 0 else 0
-
             print(f"\n{'='*60}")
-            print(f"PDF processing complete: {successful}/{page_count} pages successful")
-            print(f"Total time: {total_time:.1f}s ({avg_time:.1f}s per page)")
-
-            estimated_cost = successful * self.config.model_costs.get(self.config.qwen_model, 0.008)
-            print(f"Estimated API cost: ${estimated_cost:.3f} USD")
+            print(f"✓ Processing complete in {total_time:.1f}s")
+            print(f"✓ Output: {output_path}")
             print(f"{'='*60}")
 
-            return note_path
+            # Export to Zotero if requested
+            if export_zotero:
+                print(f"\n📚 Exporting to Zotero...")
+                collection_key = None
+                if zotero_collection:
+                    collection_key = self.zotero.get_collection_key(zotero_collection)
+                
+                self.zotero.export_to_zotero(
+                    output_path,
+                    pdf_path,
+                    self.config.qwen_model,
+                    page_count,
+                    title=zotero_title,
+                    collection_key=collection_key
+                )
+
+            return output_path
 
         except Exception as e:
-            print(f"✗ Error processing PDF {pdf_path}: {e}")
+            print(f"❌ Error processing PDF: {e}")
             import traceback
             traceback.print_exc()
             return None
 
-    def resume_from_backup(self, backup_path: str, translate: bool = False,
-                          context: str = "", output_dir: str = "./processed",
-                          quick_mode: bool = False) -> Optional[Path]:
-        """Resume processing from saved OCR backup"""
+    def resume_from_backup(self, backup_path: str, context: str = "",
+                          output_dir: str = "./processed",
+                          quick_mode: bool = False,
+                          export_zotero: bool = False,
+                          zotero_title: Optional[str] = None,
+                          zotero_collection: Optional[str] = None):
+        """Resume processing from a raw OCR backup file"""
         print(f"\n{'='*60}")
-        print(f"Resuming from OCR backup: {backup_path}")
-
-        backup_path = Path(backup_path)
-        if not self.backup_manager.validate_backup(backup_path):
-            return None
+        print(f"Resuming from backup: {backup_path}")
+        print(f"{'='*60}")
 
         try:
             with open(backup_path, 'r', encoding='utf-8') as f:
                 backup_data = json.load(f)
 
-            document_name = backup_data["document_name"]
-            all_raw_texts = backup_data["pages"]
+            doc_name = backup_data["document"]
+            combined_ocr = backup_data["raw_ocr_text"]
             pages_with_loops = backup_data.get("pages_with_loops", [])
-            total_chars = backup_data['total_characters']
+            page_count = backup_data.get("pages_processed", 0)
+            saved_context = backup_data.get("context", "")
 
-            print(f"Loaded {len(all_raw_texts)} pages from backup")
-            print(f"Total characters: {total_chars}")
-            print(f"Original document: {document_name}")
-            if pages_with_loops:
-                print(f"Pages with loops: {len(pages_with_loops)}")
+            # Use provided context or fall back to saved context
+            final_context = context if context else saved_context
 
-            # Show estimated processing time
-            estimated_chunks = (total_chars // self.config.max_text_length) + 1
-            print(f"Estimated cleaning time: {estimated_chunks * 30 / 60:.1f} minutes")
-            print(f"{'='*60}")
+            print(f"Document: {doc_name}")
+            print(f"Text length: {len(combined_ocr)} chars")
+            print(f"Pages with loops: {len(pages_with_loops)}")
 
-            # Continue with cleaning
-            print(f"\n[2/3] Combining {len(all_raw_texts)} pages and cleaning...")
-            combined_raw = '\n\n'.join(all_raw_texts)
+            # Cleaning Stage
+            print("\n" + "="*60)
+            print("STAGE 2: TEXT CLEANING (RESUMED)")
+            print("="*60)
 
-            # Use loop flag from backup
-            has_any_loops = len(pages_with_loops) > 0
-            cleaned_text = self.text_cleaner.clean_document_sequential(combined_raw, context, has_any_loops)
-            final_text = cleaned_text
-
-            # Handle translation
-            translation = None
-            if translate:
-                print(f"\n[3/3] Translating entire document...")
-                translation = self._translate_document(final_text)
-
-            note_path = self._create_consolidated_note(
-                document_name, final_text, translation, pages_with_loops,
-                output_dir, context, len(all_raw_texts)
+            has_loops = len(pages_with_loops) > 0
+            cleaned_text = self.text_cleaner.process_text_in_chunks(
+                combined_ocr, final_context, has_loops
             )
 
-            print(f"\n✓ Successfully processed from OCR backup!")
-            return note_path
+            # Final polish
+            if not quick_mode:
+                cleaned_text = self.text_cleaner.final_polish(cleaned_text, final_context)
+
+            # Create consolidated note
+            output_path = self._create_consolidated_note(
+                doc_name, cleaned_text, pages_with_loops,
+                output_dir, final_context, page_count
+            )
+
+            print(f"\n✓ Resume processing complete: {output_path}")
+
+            # Export to Zotero if requested
+            if export_zotero:
+                print(f"\n📚 Exporting to Zotero...")
+                collection_key = None
+                if zotero_collection:
+                    collection_key = self.zotero.get_collection_key(zotero_collection)
+                
+                source_file = backup_data.get("source", doc_name)
+                self.zotero.export_to_zotero(
+                    output_path,
+                    source_file,
+                    self.config.qwen_model,
+                    page_count,
+                    title=zotero_title,
+                    collection_key=collection_key
+                )
+
+            return output_path
 
         except Exception as e:
-            print(f"✗ Error processing from OCR backup: {e}")
+            print(f"❌ Error resuming from backup: {e}")
             import traceback
             traceback.print_exc()
             return None
 
-    def process_image(self, image_path: str, translate: bool = False, context: str = "",
-                 output_dir: str = "./processed", quick_mode: bool = False) -> Optional[Path]:
-        """Process a single image file"""
-        print(f"\nProcessing image: {image_path}")
-        result = self.ocr_engine.process_image(image_path, 1, 1)
-        if not result:
-            print("✗ No text detected in image")
-            return None
-        text, has_loops = result
-
-        # Clean the text
-        print(f"\n[2/2] Cleaning text...")
-        final_text = self.text_cleaner.clean_document_sequential(text, context, has_loops)
-
-        # Create document
-        os.makedirs(output_dir, exist_ok=True)
-        document_name = Path(image_path).stem
-        translation = None
-        if translate:
-            translation = self._translate_document(final_text)
-        pages_with_loops = [1] if has_loops else []
-        note_path = self._create_consolidated_note(
-            document_name, final_text, translation, pages_with_loops,
-            output_dir, context, 1
-        )
-        return note_path
-
-    def _translate_document(self, text: str) -> Optional[str]:
-        """Translate document to English"""
-        try:
-            response = self.clients.kimi.chat.completions.create(
-                model="kimi-k2-0905-preview",
-                messages=[{
-                    "role": "user",
-                    "content": f"请将以下明清文献翻译成学术英语，保持准确性：\n\n{text}"
-                }],
-                timeout=self.config.api_timeout
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"  Translation error: {e}")
-            return None
-
     def _create_consolidated_note(self, document_name: str, full_cleaned_text: str,
-                                translation: Optional[str], pages_with_loops: List[int],
+                                pages_with_loops: List[int],
                                 output_dir: str, context: str, page_count: int) -> Path:
         """Create consolidated markdown note"""
         collection = Path(output_dir).name if output_dir != "./processed" else Path(document_name).stem
@@ -850,81 +919,77 @@ class DocumentProcessor:
         quality_section = ""
         if pages_with_loops:
             quality_section = f"""
-    ## ⚠️ OCR质量提示
+## ⚠️ OCR质量提示
 
-    检测到 {len(pages_with_loops)} 页可能包含OCR循环错误，已标记供Kimi清理：
+检测到 {len(pages_with_loops)} 页可能包含OCR循环错误，已标记供Kimi清理：
 
-    **需要检查的页面**: {', '.join(map(str, pages_with_loops[:20]))}
-    {f"...及其他 {len(pages_with_loops)-20} 页" if len(pages_with_loops) > 20 else ""}
+**需要检查的页面**: {', '.join(map(str, pages_with_loops[:20]))}
+{f"...及其他 {len(pages_with_loops)-20} 页" if len(pages_with_loops) > 20 else ""}
 
-    这些页面的重复内容应该已被自动清理，但建议人工复核。
+这些页面的重复内容应该已被自动清理，但建议人工复核。
 
-    ---
-    """
+---
+"""
 
         # Build the document
         note_content = f"""---
-    type: primary-source
-    source: {document_name}
-    collection: {collection}
-    date-processed: {datetime.now().strftime('%Y-%m-%d')}
-    total-pages: {page_count}
-    flagged-pages: {len(pages_with_loops)}
-    status: {"needs-review" if pages_with_loops else "clean"}
-    ocr-engine: Qwen-VL
-    tags:
-    - primary-source
-    - {collection}
-    - Ming-Qing
-    ---
+type: primary-source
+source: {document_name}
+collection: {collection}
+date-processed: {datetime.now().strftime('%Y-%m-%d')}
+total-pages: {page_count}
+flagged-pages: {len(pages_with_loops)}
+status: {"needs-review" if pages_with_loops else "clean"}
+ocr-engine: Qwen-VL
+tags:
+- primary-source
+- {collection}
+- Ming-Qing
+---
 
-    # {document_name}
+# {document_name}
 
-    > [!info] Document Metadata
-    > - **Collection**: {collection}
-    > - **Total Pages**: {page_count}
-    > - **Flagged Pages**: {len(pages_with_loops)}/{page_count}
-    > - **Processing Date**: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-    > - **OCR Engine**: Qwen-VL ({self.config.qwen_model})
-    > - **Context**: {context if context else "None"}
-    > - **Status**: {"🟡 Needs Review" if pages_with_loops else "🟢 Clean"}
+> [!info] Document Metadata
+> - **Collection**: {collection}
+> - **Total Pages**: {page_count}
+> - **Flagged Pages**: {len(pages_with_loops)}/{page_count}
+> - **Processing Date**: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+> - **OCR Engine**: Qwen-VL ({self.config.qwen_model})
+> - **Context**: {context if context else "None"}
+> - **Status**: {"🟡 Needs Review" if pages_with_loops else "🟢 Clean"}
 
-    ---
+---
 
-    {quality_section}
+{quality_section}
 
-    ## 全文整理
+## 全文整理
 
-    {full_cleaned_text}
-    """
-
-        # Add translation if provided
-        if translation:
-            note_content += f"\n---\n\n## English Translation\n\n{translation}\n"
+{full_cleaned_text}
+"""
 
         # Add research notes section
         note_content += f"""
-    ---
+---
 
-    ## 研究笔记
+## 研究笔记
 
-    ### 关键术语
-    -
+### 关键术语
+-
 
-    ### 历史语境
-    -
+### 历史语境
+-
 
-    ### 相关文献
-    -
+### 相关文献
+-
 
-    ---
+---
 
-    ## 处理历史
-    - {datetime.now().strftime('%Y-%m-%d')}: OCR (Qwen-VL) and initial processing
-    - Pages processed: {page_count}
-    - Model used: {self.config.qwen_model}
-    - Pages with loops: {len(pages_with_loops)}
-    """
+## 处理历史
+- {datetime.now().strftime('%Y-%m-%d')}: OCR (Qwen-VL) and initial processing
+- Pages processed: {page_count}
+- Model used: {self.config.qwen_model}
+- Pages with loops: {len(pages_with_loops)}
+"""
 
         # Save file
         output_path = Path(output_dir) / f"{document_name}.md"
@@ -951,9 +1016,6 @@ Examples:
   # Process PDF with context
   %(prog)s document.pdf --context "明代文集，竖排无标点" --output ~/Obsidian/Primary-Sources/
 
-  # Process with translation
-  %(prog)s document.pdf --translate --output ./processed
-
   # Quick mode (skip final polish)
   %(prog)s document.pdf --quick --output ./processed
 
@@ -972,13 +1034,15 @@ Examples:
   # Resume from OCR backup
   %(prog)s --resume-from ./processed/document_raw_ocr_latest.json --output ./processed
 
+  # Export to Zotero
+  %(prog)s document.pdf --zotero --zotero-collection "Primary Sources" --output ./processed
+
   # Batch process directory
   %(prog)s ./scans/ --batch --context "泉州府志" --output ~/Obsidian/Primary-Sources/
 """
     )
 
     parser.add_argument('input', nargs='?', help='Image file, PDF, or directory (not required with --resume-from)')
-    parser.add_argument('--translate', action='store_true', help='Include English translation')
     parser.add_argument('--context', default='', help='Contextual information')
     parser.add_argument('--output', default='./processed', help='Output directory')
     parser.add_argument('--batch', action='store_true', help='Process all files in directory')
@@ -988,6 +1052,9 @@ Examples:
     parser.add_argument('--max-pages', type=int, help='Limit processing to first N pages')
     parser.add_argument('--start-page', type=int, default=1, help='Start processing from page N (default: 1)')
     parser.add_argument('--resume-from', help='Resume from raw OCR JSON file')
+    parser.add_argument('--zotero', action='store_true', help='Export to Zotero after processing')
+    parser.add_argument('--zotero-title', help='Custom title for Zotero item (defaults to filename)')
+    parser.add_argument('--zotero-collection', help='Zotero collection name to file the item in')
 
     return parser
 
@@ -1013,7 +1080,10 @@ def main():
             print(f"❌ Error: Backup file {args.resume_from} not found")
             sys.exit(1)
         processor.resume_from_backup(
-            args.resume_from, args.translate, args.context, args.output, args.quick
+            args.resume_from, args.context, args.output, args.quick,
+            export_zotero=args.zotero,
+            zotero_title=args.zotero_title,
+            zotero_collection=args.zotero_collection
         )
         return
 
@@ -1043,14 +1113,20 @@ def main():
         failed = 0
 
         for img in images:
-            result = processor.process_image(str(img), args.translate, args.context, args.output, args.quick)
+            result = processor.process_image(str(img), args.context, args.output, args.quick)
             if result:
                 successful += 1
             else:
                 failed += 1
 
         for pdf in pdfs:
-            result = processor.process_pdf(str(pdf), args.translate, args.context, args.output, args.quick, args.max_pages, args.start_page)
+            result = processor.process_pdf(
+                str(pdf), args.context, args.output, args.quick, 
+                args.max_pages, args.start_page,
+                export_zotero=args.zotero,
+                zotero_title=args.zotero_title,
+                zotero_collection=args.zotero_collection
+            )
             if result:
                 successful += 1
             else:
@@ -1073,9 +1149,15 @@ def main():
                 print("❌ Error: PDF support not available")
                 print("   Install with: pip install pdf2image")
                 sys.exit(1)
-            processor.process_pdf(args.input, args.translate, args.context, args.output, args.quick, args.max_pages, args.start_page)
+            processor.process_pdf(
+                args.input, args.context, args.output, args.quick, 
+                args.max_pages, args.start_page,
+                export_zotero=args.zotero,
+                zotero_title=args.zotero_title,
+                zotero_collection=args.zotero_collection
+            )
         else:
-            processor.process_image(args.input, args.translate, args.context, args.output, args.quick)
+            processor.process_image(args.input, args.context, args.output, args.quick)
 
         print("\n✓ Processing complete!")
 

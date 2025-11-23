@@ -13,7 +13,8 @@ There are various commands listed below to change how it processes your file(s).
 
 YOU WILL NEED
 1. AliCloud and Moonshot API keys, as well as sufficient funds to use them.
-     - If you don't have these, go [here](https://www.alibabacloud.com/help/en/model-studio/get-api-key) and [here](https://platform.moonshot.ai/docs/overview) and follow the steps. Note that for Qwen, you have the choice between a Chinese or international API key. The Chinese key will be cheaper, but requires a Chinese phone         number and ID verification. The script is set up for Alicloud's international servers, but you can easily adjust it to the Chinese version. Moonshot doesn't                distinguish and also won't require ID verification.
+     - If you don't have these, go [here](https://www.alibabacloud.com/help/en/model-studio/get-api-key) and [here](https://platform.moonshot.ai/docs/overview) and follow the steps. Note that for Qwen, you have the choice between a Chinese or international (Singapore) API key. The Chinese key will be cheaper, but requires a Chinese phone         number and ID verification. The script is set up for Alicloud's international servers, but you can easily adjust it to the Chinese version. Moonshot doesn't                distinguish and also won't require ID verification.
+     - I've implemented basic Zotero integration, so if you want to export directly to your Zotero account, you'll also need to set your Zotero API and user ID as environmental variables. 
 3. Basic familiarity with running python scripts in terminal.
      - Make sure you have Python installed, as well as all necessary dependencies: pdf2image, openai, and requests. Non-Windows users may need to separately install Poppler as well (it installs with Pdf2Image on PC)
 4. A GOOD PDF scan of your document. If Qwen can't make any sense of your document (at least ~75-80% accurate) things will break down.

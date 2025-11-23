@@ -3,6 +3,8 @@ It does this by leveraging the current best OCR engine for classical Chinese, Qw
 
 The full process is: input PDF -> PDF is split into single page PNGs -> send to Qwen-vl-max for OCR -> output raw OCR as one combined file -> chunk raw output into manageable blocks -> send to Kimi K2 for editing -> recombine Kimi's output into a single .md file and export.
 
+There is also a simplified version of this script, called "simpleprox.py," which is intended for modern, punctuated reprints of Chinese texts. If your PDF already includes punctuation you can use this text to skip the second stage of processing, since Qwen can handle everything on its own, making the process faster and cheaper. In theory you could probably edit the Qwen prompt to make this script rip .md output from any PDF in any language. 
+
 The price of the whole process averages around $0.01 per page, and the final results are better than you'll generally find anywhere else for obscure texts, if your scan is good quality. It won't give 100% accurate results, but it normally hits 90+% of characters correct in my tests. This is generally high enough for the full context to be clear, although you'll want to double check sections that are important to you against the original scan. Also, it is possible for whole chunks of text to get corrupted or lost, but this is rare unless the scanned text is in an unusual format or somehow damaged. In such cases the damage is normally limited to single pages or less.
 
 In general it takes around 30s-1m per page, so a full book will run for a few hours. The log will let you know how things are going and roughly how long everything is taking. It's normally safe to leave it until it finishes, but you might want to check if any errors pop up. 

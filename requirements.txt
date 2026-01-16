@@ -1,0 +1,17 @@
+# Zhiliu App - Python Dependencies
+# Install with: pip3 install -r requirements.txt
+
+# Core dependencies
+openai>=1.0.0
+requests>=2.31.0
+
+# PDF processing
+pdf2image>=1.16.0
+Pillow>=10.0.0
+
+# Image processing (optional but recommended)
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Additional utilities
+PyPDF2>=3.0.0

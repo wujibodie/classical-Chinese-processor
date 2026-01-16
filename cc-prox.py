@@ -13,6 +13,8 @@ import time
 import tempfile
 import base64
 import argparse
+import concurrent.futures
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Any
@@ -28,7 +30,7 @@ try:
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
-    print("⚠️  Warning: pdf2image not installed. PDF support disabled.")
+    print("⚠️  Warning: pdf2image not installed. PDF support disabled.", flush=True)
 
 try:
     import cv2
@@ -36,7 +38,7 @@ try:
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
-    print("⚠️  Warning: opencv-python not installed. Image preprocessing disabled.")
+    print("⚠️  Warning: opencv-python not installed. Image preprocessing disabled.", flush=True)
 
 # ============================================================================
 # CONFIGURATION MANAGEMENT
@@ -46,9 +48,12 @@ except ImportError:
 class ProcessingConfig:
     """Centralized configuration for document processing"""
     # OCR Settings
-    ocr_dpi: int = 200
-    qwen_model: str = "qwen-vl-max"
-    max_image_width: int = 1024
+    ocr_dpi: int = 300
+    qwen_model: str = "qwen3-vl-plus"
+    max_image_width: int = 3072
+
+    # Cleanup Settings
+    cleanup_model: str = "deepseek"  # "kimi" or "deepseek"
 
     # OCR Quality Thresholds
     expected_chars_normal: int = 500   # Flag if above this
@@ -68,7 +73,7 @@ class ProcessingConfig:
     def __post_init__(self):
         if self.model_costs is None:
             self.model_costs = {
-                "qwen-vl-plus": 0.004,
+                "qwen3-vl-plus": 0.004,
                 "qwen-vl-max": 0.008,
             }
 
@@ -78,6 +83,8 @@ class ProcessingConfig:
             self.ocr_dpi = args.dpi
         if hasattr(args, 'model'):
             self.qwen_model = args.model
+        if hasattr(args, 'cleanup_model'):
+            self.cleanup_model = args.cleanup_model
 
 # ============================================================================
 # CLIENT MANAGEMENT
@@ -86,14 +93,24 @@ class ProcessingConfig:
 class APIClients:
     """Manages API clients for different services"""
 
-    def __init__(self):
-        if not self.validate_keys():
+    def __init__(self, cleanup_model: str = "kimi"):
+        if not self.validate_keys(cleanup_model):
             raise Exception("API keys not configured")
 
-        self.kimi = OpenAI(
-            api_key=os.getenv("KIMI_API_KEY"),
-            base_url="https://api.moonshot.cn/v1"
-        )
+        self.kimi = None
+        self.deepseek = None
+
+        # Initialize cleanup model client
+        if cleanup_model == "kimi":
+            self.kimi = OpenAI(
+                api_key=os.getenv("KIMI_API_KEY"),
+                base_url="https://api.moonshot.cn/v1"
+            )
+        elif cleanup_model == "deepseek":
+            self.deepseek = OpenAI(
+                api_key=os.getenv("DEEPSEEK_API_KEY"),
+                base_url="https://api.deepseek.com"
+            )
 
         self.qwen = OpenAI(
             api_key=os.getenv("DASHSCOPE_API_KEY"),
@@ -101,14 +118,20 @@ class APIClients:
         )
 
     @staticmethod
-    def validate_keys():
+    def validate_keys(cleanup_model: str = "kimi"):
         """Validate that required API keys are set"""
         if not os.getenv("DASHSCOPE_API_KEY"):
-            print("❌ Error: DASHSCOPE_API_KEY environment variable not set")
+            print("❌ Error: DASHSCOPE_API_KEY environment variable not set", flush=True)
             return False
-        if not os.getenv("KIMI_API_KEY"):
-            print("❌ Error: KIMI_API_KEY environment variable not set")
+
+        if cleanup_model == "kimi" and not os.getenv("KIMI_API_KEY"):
+            print("❌ Error: KIMI_API_KEY environment variable not set", flush=True)
             return False
+
+        if cleanup_model == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"):
+            print("❌ Error: DEEPSEEK_API_KEY environment variable not set", flush=True)
+            return False
+
         return True
 
 # ============================================================================
@@ -216,7 +239,7 @@ class ImageProcessor:
                 ratio = config.max_image_width / w
                 new_h = int(h * ratio)
                 gray = cv2.resize(gray, (config.max_image_width, new_h), interpolation=cv2.INTER_AREA)
-                print(f"    Resized image from {w}x{h} to {config.max_image_width}x{new_h}")
+                print(f"    Resized image from {w}x{h} to {config.max_image_width}x{new_h}", flush=True)
 
             # Denoise and binarize
             denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
@@ -228,7 +251,7 @@ class ImageProcessor:
             return temp_file.name
 
         except Exception as e:
-            print(f"Preprocessing error: {e}")
+            print(f"Preprocessing error: {e}", flush=True)
             return image_path
 
     @staticmethod
@@ -241,7 +264,7 @@ class ImageProcessor:
             # If this 100-char chunk appears again, cut before second occurrence
             second_occurrence = text.find(sample, i+100)
             if second_occurrence != -1:
-                print(f"    ✂️ Cutting at char {second_occurrence} (loop detected)")
+                print(f"    ✂️ Cutting at char {second_occurrence} (loop detected)", flush=True)
                 return text[:second_occurrence]
         return text[:max_length]
 
@@ -265,7 +288,8 @@ class ZoteroExporter:
             headers = {"Zotero-API-Key": api_key}
             response = requests.get(
                 f"https://api.zotero.org/users/{user_id}/collections",
-                headers=headers
+                headers=headers,
+                params={"limit": 100}
             )
             
             if response.status_code != 200:
@@ -276,11 +300,11 @@ class ZoteroExporter:
                 if collection['data']['name'] == collection_name:
                     return collection['data']['key']
             
-            print(f"⚠️  Collection '{collection_name}' not found in Zotero library")
+            print(f"⚠️  Collection '{collection_name}' not found in Zotero library", flush=True)
             return None
             
         except Exception as e:
-            print(f"❌ Error looking up collection: {e}")
+            print(f"❌ Error looking up collection: {e}", flush=True)
             return None
     
     @staticmethod
@@ -298,7 +322,7 @@ class ZoteroExporter:
         user_id = os.getenv("ZOTERO_USER_ID")
         
         if not api_key or not user_id:
-            print("⚠️  Warning: ZOTERO_API_KEY or ZOTERO_USER_ID not set. Skipping Zotero export.")
+            print("⚠️  Warning: ZOTERO_API_KEY or ZOTERO_USER_ID not set. Skipping Zotero export.", flush=True)
             return None
         
         try:
@@ -339,13 +363,13 @@ class ZoteroExporter:
             )
             
             if response.status_code != 200:
-                print(f"❌ Failed to create Zotero item: {response.status_code}")
-                print(response.text)
+                print(f"❌ Failed to create Zotero item: {response.status_code}", flush=True)
+                print(response.text, flush=True)
                 return None
             
             # Get the created item key
             item_key = response.json()['successful']['0']['key']
-            print(f"✓ Created Zotero item: {item_key}")
+            print(f"✓ Created Zotero item: {item_key}", flush=True)
             
             # Attach markdown file
             with open(markdown_path, 'rb') as f:
@@ -362,14 +386,14 @@ class ZoteroExporter:
             )
             
             if attachment_response.status_code == 200:
-                print(f"✓ Attached markdown file to Zotero item")
+                print(f"✓ Attached markdown file to Zotero item", flush=True)
             else:
-                print(f"⚠️  Warning: Failed to attach file: {attachment_response.status_code}")
+                print(f"⚠️  Warning: Failed to attach file: {attachment_response.status_code}", flush=True)
             
             return item_key
             
         except Exception as e:
-            print(f"❌ Error exporting to Zotero: {e}")
+            print(f"❌ Error exporting to Zotero: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
@@ -386,10 +410,12 @@ class OCREngine:
         self.config = config
         self.text_processor = TextProcessor()
 
-    def process_image(self, image_path: str, page_num: int, total_pages: int) -> Optional[Tuple[str, bool]]:
+    def process_image(self, image_path: str, page_num: int, total_pages: int, current_index: int = None) -> Optional[Tuple[str, bool]]:
         """Process a single image and return text with loop detection flag"""
-        progress = f"({page_num}/{total_pages}, {page_num*100//total_pages}%)" if total_pages > 1 else ""
-        print(f"\n--- Page {page_num} {progress} ---")
+        # Use current_index for progress calculation if provided, otherwise fall back to page_num
+        progress_index = current_index if current_index is not None else page_num
+        progress = f"({progress_index}/{total_pages}, {progress_index*100//total_pages}%)" if total_pages > 1 else ""
+        print(f"\n--- Page {page_num} {progress} ---", flush=True)
 
         # Preprocess image
         processed_path = ImageProcessor.preprocess_image(image_path, self.config)
@@ -442,11 +468,11 @@ class OCREngine:
                 except Exception as e:
                     if attempt < self.config.retry_attempts - 1:
                         wait_time = self.config.retry_delay * (2 ** attempt)
-                        print(f"  ⚠️  OCR error (attempt {attempt+1}/{self.config.retry_attempts}): {e}")
-                        print(f"  Retrying in {wait_time}s...")
+                        print(f"  ⚠️  OCR error (attempt {attempt+1}/{self.config.retry_attempts}): {e}", flush=True)
+                        print(f"  Retrying in {wait_time}s...", flush=True)
                         time.sleep(wait_time)
                     else:
-                        print(f"  ❌ All OCR retry attempts failed: {e}")
+                        print(f"  ❌ All OCR retry attempts failed: {e}", flush=True)
                         return None
 
             if text is None:
@@ -456,24 +482,24 @@ class OCREngine:
 
             # Progressive quality checks with our agreed thresholds
             if char_count > self.config.expected_chars_normal:
-                print(f"  ⚠️  Long page: {char_count} chars (expected <{self.config.expected_chars_normal})")
+                print(f"  ⚠️  Long page: {char_count} chars (expected <{self.config.expected_chars_normal})", flush=True)
 
             if char_count > self.config.ocr_soft_cap:
-                print(f"  ⚠️  Very long page: {char_count} chars (soft cap: {self.config.ocr_soft_cap})")
+                print(f"  ⚠️  Very long page: {char_count} chars (soft cap: {self.config.ocr_soft_cap})", flush=True)
 
             if char_count > self.config.ocr_hard_cap:
-                print(f"  🔴 Excessive length: {char_count} chars - truncating to {self.config.ocr_hard_cap}")
+                print(f"  🔴 Excessive length: {char_count} chars - truncating to {self.config.ocr_hard_cap}", flush=True)
                 text = text[:self.config.ocr_hard_cap]
 
             # Detect loops and first pass truncation
             has_loops = self.text_processor.detect_ocr_loops_simple(text)
 
             if has_loops:
-                print(f"  🔄 Potential OCR loops detected - truncating aggressively")
+                print(f"  🔄 Potential OCR loops detected - truncating aggressively", flush=True)
                 # Find first major repetition and cut there
                 text = ImageProcessor.truncate_at_loop(text, max_length=800)
 
-            print(f"  ✓ OCR success ({len(text)} chars{', has loops' if has_loops else ''})")
+            print(f"  ✓ OCR success ({len(text)} chars{', has loops' if has_loops else ''})", flush=True)
 
             # Remove library metadata
             cleaned_text = self.text_processor.remove_metadata_text(text)
@@ -493,30 +519,120 @@ class OCREngine:
 # ============================================================================
 
 class TextCleaner:
-    """Handles Kimi text cleaning operations"""
+    """Handles text cleaning operations with Kimi or DeepSeek"""
 
     def __init__(self, clients: APIClients, config: ProcessingConfig):
         self.clients = clients
         self.config = config
         self.text_processor = TextProcessor()
 
-    def clean_chunk(self, text_chunk: str, context: str = "", has_ocr_loops: bool = False) -> str:
+    def _get_cleanup_client_and_model(self):
+        """Get the appropriate client and model name for cleanup operations"""
+        if self.config.cleanup_model == "deepseek":
+            return self.clients.deepseek, "deepseek-chat"
+        else:  # default to kimi
+            return self.clients.kimi, "kimi-k2-0905-preview"
+
+    def sanitize_output(self, text: str) -> str:
+        """
+        Remove context markers if they accidentally appear in output.
+        This is a failsafe - should rarely be needed if prompts work correctly.
+        """
+        # Remove any [[...]] blocks that slipped through
+        cleaned = re.sub(r'\[\[上文参考[^\]]*\]\]', '', text, flags=re.DOTALL)
+        cleaned = cleaned.strip()
+        return cleaned
+
+    def detect_overlap_duplicate(self, prev_tail: str, curr_head: str,
+                                 threshold: float = 0.85, min_length: int = 200) -> int:
+        """
+        Detect if curr_head contains a duplicate of prev_tail.
+        Returns: length of duplicate if found, 0 otherwise.
+
+        Uses character-level matching with high threshold to be conservative.
+        """
+        # Search for matching sequences at the boundary
+        max_search = min(len(prev_tail), len(curr_head), 800)
+        best_match_len = 0
+
+        # Look for matches starting from the end of prev_tail
+        for i in range(max_search, min_length, -10):  # Step by 10 for efficiency
+            tail_segment = prev_tail[-i:]
+            if curr_head.startswith(tail_segment):
+                # Found exact match at boundary
+                if i >= min_length:
+                    similarity = 1.0
+                    if similarity >= threshold:
+                        best_match_len = i
+                        break
+            else:
+                # Check fuzzy match
+                matches = 0
+                check_len = min(i, len(curr_head))
+                for j in range(check_len):
+                    if j < len(prev_tail) and prev_tail[-(i-j)] == curr_head[j]:
+                        matches += 1
+
+                similarity = matches / i if i > 0 else 0
+                if similarity >= threshold and i >= min_length:
+                    best_match_len = i
+                    break
+
+        return best_match_len
+
+    def clean_chunk(self, text_chunk: str, context: str = "", has_ocr_loops: bool = False,
+                   has_marked_context: bool = False) -> str:
         """Clean a single chunk of text with retry logic"""
         start_time = time.time()
         loop_warning = ""
         if has_ocr_loops:
             loop_warning = "\n\n**重要提示**：此文本可能包含OCR识别循环导致的重复内容，请仔细检查并删除所有重复部分。"
 
-        prompt = f"""请将以下OCR文本整理成连贯的文言文文献。这是明清时期的文集。
+        # Base requirements
+        base_requirements = """1. 绝对必须保持原文的繁简体字形式。严禁擅自转换字形。
+2. 【核心原则】严格保持所有原文字符不变。**仅在以下三种情况可考虑修正**：
+   a. **字形高度相似且语境完全不通**（如「己」「已」「巳」在明显错误的语境）
+   b. **明显不符合时代特征的用字**（如现代简体字混入明清文献）
+   c. **同一字在文中稳定出现，仅个别处明显误写**（参考上下文一致性）
+   修正时必须选择**最接近原字形**的合理汉字，并在修正处添加【？】标注。
+3. 添加文言文适用的标点符号（句号、逗号、顿号、问号）。
+4. 删除所有机构元数据（如页码、图书馆标记、[空页]等）。
+5. 将文本整理成连贯段落，但**保持原文的章节层次和自然换行**。
+6. 对于无法确定的字，用【？】标注。
+7. **特别注意：如果发现重复出现的文本块（OCR识别循环错误），请删除这些重复部分**。
+8. **如果文本明显不完整或被截断，保持原样即可**。
+9. 【新增】**对于古汉语中的异体字、通假字、避讳字等，即使看起来不常见，也必须保留原字**。
+
+重要提醒：当不确定是否应该修正时，一律选择**保留原字**。"""
+
+        # Add special instructions for chunks with marked context
+        if has_marked_context:
+            context_instruction = """
+
+**重要说明 - 关于上文参考**：
+- 文本开头有 [[上文参考...]] 括起的部分，这是前一段的结尾，已经处理过
+- [[...]] 中的内容仅供你理解上下文，帮助你正确理解接下来的文本
+- **绝对不要在输出中包含或重复 [[...]] 中的任何内容**
+- 只处理并输出 [[...]] 之后的文本
+- 如果 [[...]] 后的文本开头是不完整的句子，请根据上下文理解其含义，但仍然不要输出上文参考的内容
+- 直接从 [[...]] 后面的第一个字开始输出你的处理结果"""
+
+            prompt = f"""请将以下OCR文本整理成连贯的文言文文献。這是明清時期的文獻。
+
 要求：
-1. 修正明显的OCR识别错误（形近字误认等）
-2. 添加适当的标点符号（句号、逗号等）使其可读
-3. 保持原文的古汉语特征，不要现代化
-4. 删除所有机构元数据（如页码、图书馆标记等）
-5. 将文本整理成连贯的段落
-6. 对于无法确定的字，用【？】标注
-7. **特别注意：如果发现重复出现的文本块（OCR识别循环错误），请删除这些重复部分**
-8. **如果文本明显不完整或被截断，保持原样即可**{loop_warning}
+{base_requirements}{loop_warning}{context_instruction}
+
+{f"上下文提示：{context}" if context else ""}
+
+待处理文本：
+{text_chunk}
+
+请直接返回整理后的文本，不要包含任何额外的说明、列表或标题，立即开始正文："""
+        else:
+            prompt = f"""请将以下OCR文本整理成连贯的文言文文献。這是明清時期的文獻。
+
+要求：
+{base_requirements}{loop_warning}
 
 {f"上下文提示：{context}" if context else ""}
 
@@ -527,106 +643,620 @@ OCR文本：
 
         for attempt in range(self.config.retry_attempts):
             try:
-                response = self.clients.kimi.chat.completions.create(
-                    model="kimi-k2-0905-preview",
+                sys.stdout.flush()  # Force flush before API call
+                client, model = self._get_cleanup_client_and_model()
+                response = client.chat.completions.create(
+                    model=model,
                     messages=[{"role": "user", "content": prompt}],
                     timeout=self.config.api_timeout,
                     max_tokens=2048
                 )
                 processing_time = time.time() - start_time
-                print(f"({processing_time:.1f}s)")
-                return response.choices[0].message.content
+                print(f"✓ ({processing_time:.1f}s)", flush=True)
+
+                # Sanitize output to remove any context markers that slipped through
+                cleaned_output = self.sanitize_output(response.choices[0].message.content)
+                return cleaned_output
 
             except Exception as e:
-                print(f"✗ Error (attempt {attempt+1}/{self.config.retry_attempts}): {e}")
+                print(f"\n✗ Error (attempt {attempt+1}/{self.config.retry_attempts}): {e}", flush=True)
                 if attempt < self.config.retry_attempts - 1:
                     wait_time = self.config.retry_delay * (2 ** attempt)
-                    print(f"    Retrying in {wait_time} seconds...")
+                    print(f"    Retrying in {wait_time} seconds...", flush=True)
                     time.sleep(wait_time)
                 else:
-                    print("    All retry attempts failed. Returning original text.")
+                    print("    All retry attempts failed. Returning original text.", flush=True)
                     return text_chunk
 
         return text_chunk
 
-    def create_chunks_with_overlap(self, text: str) -> List[Tuple[str, int, int]]:
-        """Create overlapping chunks for processing"""
+    def create_chunks_with_overlap(self, text: str) -> List[Tuple[int, int]]:
+        """Create overlapping chunks for processing (stores indices only, not text)"""
+        # Validate configuration to prevent infinite loops and data loss
+        if self.config.max_text_length <= 0:
+            raise ValueError(
+                f"max_text_length ({self.config.max_text_length}) must be positive"
+            )
+        if self.config.chunk_overlap < 0:
+            raise ValueError(
+                f"chunk_overlap ({self.config.chunk_overlap}) must be non-negative"
+            )
+        if self.config.chunk_overlap >= self.config.max_text_length:
+            raise ValueError(
+                f"chunk_overlap ({self.config.chunk_overlap}) must be less than "
+                f"max_text_length ({self.config.max_text_length}) to avoid infinite loops"
+            )
+
         chunks = []
         start = 0
 
         while start < len(text):
             end = min(start + self.config.max_text_length, len(text))
-            chunk = text[start:end]
-            chunks.append((chunk, start, end))
+            chunks.append((start, end))  # Store indices only, not chunk text
+
+            # If we've reached the end of the text, stop
+            if end >= len(text):
+                break
+
             start = end - self.config.chunk_overlap
 
-        print(f"Created {len(chunks)} chunks with {self.config.chunk_overlap}-char overlap")
+        print(f"Created {len(chunks)} chunks with {self.config.chunk_overlap}-char overlap", flush=True)
         return chunks
 
     def process_text_in_chunks(self, text: str, context: str = "", has_ocr_loops: bool = False) -> str:
-        """Process text in chunks with overlap"""
-        if len(text) <= self.config.max_text_length:
-            print("Processing single chunk...", end=' ')
-            return self.clean_chunk(text, context, has_ocr_loops)
+        """
+        Process text in chunks with marked context to prevent duplication.
 
-        print(f"\nText length: {len(text)} chars")
-        chunks = self.create_chunks_with_overlap(text)
+        Strategy:
+        1. First chunk: process normally
+        2. Subsequent chunks: add [[上文参考...]] marker with previous overlap
+        3. Apply conservative deduplication as safety net
+        """
+        if len(text) <= self.config.max_text_length:
+            print("Text fits in single chunk, processing...", flush=True)
+            return self.clean_chunk(text, context, has_ocr_loops, has_marked_context=False)
+
+        print(f"Text length: {len(text)} chars - splitting into chunks...", flush=True)
+        chunk_indices = self.create_chunks_with_overlap(text)
         cleaned_chunks = []
 
-        for i, (chunk, start, end) in enumerate(chunks, 1):
-            print(f"\nProcessing chunk {i}/{len(chunks)} (chars {start}-{end})...", end=' ')
-            cleaned = self.clean_chunk(chunk, context, has_ocr_loops)
-            cleaned_chunks.append(cleaned)
+        # Process chunks one at a time
+        for i, (start, end) in enumerate(chunk_indices, 1):
+            print(f"\nProcessing chunk {i}/{len(chunk_indices)} (chars {start}-{end})... ", end='', flush=True)
 
-        combined = '\n\n'.join(cleaned_chunks)
-        print(f"\n✓ Combined all chunks into {len(combined)} chars")
+            # Extract chunk text from original
+            chunk_text = text[start:end]
+
+            # For non-first chunks, add context marker
+            if i > 1:
+                # Get context from original text (previous overlap region)
+                context_start = max(0, start - self.config.chunk_overlap)
+                context_text = text[context_start:start]
+
+                # Create marked chunk with explicit context
+                marked_chunk = f"""[[上文参考（已处理完毕，请勿在输出中重复）：
+{context_text}
+]]
+
+{chunk_text}"""
+
+                print(f"With marked context, sending to Kimi API... ", end='', flush=True)
+                cleaned = self.clean_chunk(marked_chunk, context, has_ocr_loops, has_marked_context=True)
+            else:
+                print(f"First chunk, sending to Kimi API... ", end='', flush=True)
+                cleaned = self.clean_chunk(chunk_text, context, has_ocr_loops, has_marked_context=False)
+
+            cleaned_chunks.append(cleaned)
+            del chunk_text  # Explicitly release references
+
+        # Clear chunk indices
+        del chunk_indices
+
+        # SAFETY NET: Apply conservative deduplication between chunks
+        print(f"\n\nApplying deduplication safety net...", flush=True)
+        deduped_chunks = [cleaned_chunks[0]]  # First chunk always kept as-is
+
+        for i in range(1, len(cleaned_chunks)):
+            prev_chunk = deduped_chunks[-1]
+            curr_chunk = cleaned_chunks[i]
+
+            # Check for duplicates at the boundary
+            duplicate_len = self.detect_overlap_duplicate(
+                prev_tail=prev_chunk[-800:],  # Check last 800 chars of previous
+                curr_head=curr_chunk[:800],    # Check first 800 chars of current
+                threshold=0.85,
+                min_length=200
+            )
+
+            if duplicate_len > 0:
+                print(f"   Chunk {i+1}: Removed {duplicate_len}-char duplicate", flush=True)
+                deduped_chunks.append(curr_chunk[duplicate_len:])
+            else:
+                deduped_chunks.append(curr_chunk)
+
+        # Join deduplicated chunks
+        combined = '\n\n'.join(deduped_chunks)
+        print(f"✓ Combined {len(deduped_chunks)} chunks into {len(combined)} chars", flush=True)
+
+        # Clear intermediate lists
+        del cleaned_chunks
+        del deduped_chunks
+
         return combined
 
-    def final_polish(self, text: str, context: str = "") -> str:
-        """Final polish pass on the complete text"""
-        print("\n=== Final Polish Pass ===")
-        prompt = f"""请对以下已整理的文言文进行最终润色。这是明清时期的文献。
+    def generate_review_report(self, text: str, context: str = "") -> str:
+        """
+        Generate quality review report for processed text.
+        DOES NOT rewrite text - only identifies issues for manual review.
+        Prevents data loss from token limits.
+        """
+        print("\n=== Quality Review Analysis ===", flush=True)
 
-要求：
-1. 移除Kimi可能添加的任何说明性文字（如"改写说明"、"润色说明"等）
-2. 修正剩余的明显错误
-3. 确保标点符号正确且一致
-4. 确保段落之间有适当的连贯性
-5. 删除任何重复的段落或文本块
-6. 保持原文的古汉语特征
-7. **不要添加任何新的说明、标题或元数据**
-8. **直接输出润色后的正文，不要有任何前言或后记**
+        # Sample text for analysis (first 20000 chars + last 20000 chars)
+        # This ensures we check beginning and end without exceeding token limits
+        text_length = len(text)
+        if text_length > 40000:
+            sample_text = text[:20000] + "\n\n[...中间部分已省略...]\n\n" + text[-20000:]
+            print(f"   Analyzing sample: {text_length} chars (sampling first/last 20k)", flush=True)
+        else:
+            sample_text = text
+            print(f"   Analyzing full text: {text_length} chars", flush=True)
+
+        prompt = f"""你是一位古籍整理专家。请仔细审阅以下已处理的文言文文本，识别可能存在的问题。
+
+这是明清时期的文献。文本已经过OCR识别和初步整理。
+
+请分析文本并列出以下类型的问题：
+
+1. **繁简体混用**：检查是否有擅自将繁體字转换为简体字（或反之）的情况，这是严重错误
+2. **重复内容**：明显重复的段落或句子（非原文本身的重复结构）
+3. **OCR错误**：可能的误认字（形近字混淆）
+4. **标点问题**：标点符号使用明显不当或不一致
+5. **格式问题**：段落结构混乱或异常
+6. **说明性文字**：AI可能添加的注释或说明（应删除）
+7. **截断问题**：文本开头或结尾是否有截断迹象
 
 {f"上下文提示：{context}" if context else ""}
 
-文本：
-{text}
+文本样本：
+{sample_text}
 
-请直接输出润色后的完整文本："""
+请按以下格式输出审查报告：
+
+## 质量审查报告
+
+### 1. 重复内容
+[如有发现，列出具体位置和内容；如无，写"未发现"]
+
+### 2. 可能的OCR错误
+[列出可疑的字符，如"某某某（疑为XX）"；如无，写"未发现明显错误"]
+
+### 3. 标点问题
+[列出标点使用不当的地方；如无，写"标点使用基本正常"]
+
+### 4. 格式问题
+[列出格式混乱的地方；如无，写"格式基本正常"]
+
+### 5. 说明性文字
+[列出需要删除的注释或说明；如无，写"未发现"]
+
+### 6. 文本完整性
+[评估文本开头和结尾是否完整；是否有截断]
+
+### 7. 总体评价
+[简要评价处理质量，1-5星]
+
+### 8. 建议
+[给出人工审校的重点建议]
+
+请客观、具体地指出问题，便于人工审校。"""
 
         for attempt in range(self.config.retry_attempts):
             try:
-                response = self.clients.kimi.chat.completions.create(
-                    model="kimi-k2-0905-preview",
+                client, model = self._get_cleanup_client_and_model()
+                response = client.chat.completions.create(
+                    model=model,
                     messages=[{"role": "user", "content": prompt}],
                     timeout=self.config.api_timeout,
-                    max_tokens=4096
+                    max_tokens=4096  # Sufficient for review report
                 )
-                polished = response.choices[0].message.content
-                print("✓ Final polish complete")
-                return self.text_processor.remove_explanatory_text(polished)
+                review_report = response.choices[0].message.content
+                print("✓ Quality review complete", flush=True)
+                return review_report
 
             except Exception as e:
-                print(f"✗ Polish error (attempt {attempt+1}/{self.config.retry_attempts}): {e}")
+                print(f"✗ Review error (attempt {attempt+1}/{self.config.retry_attempts}): {e}", flush=True)
                 if attempt < self.config.retry_attempts - 1:
                     wait_time = self.config.retry_delay * (2 ** attempt)
-                    print(f"    Retrying in {wait_time} seconds...")
+                    print(f"    Retrying in {wait_time} seconds...", flush=True)
                     time.sleep(wait_time)
                 else:
-                    print("    All retry attempts failed. Returning unpolished text.")
-                    return text
+                    print("    All retry attempts failed. Skipping review.", flush=True)
+                    return "质量审查失败：API调用超时或出错\n\n建议人工全面审校文本。"
 
-        return text
+        return "质量审查失败：达到最大重试次数\n\n建议人工全面审校文本。"
+
+class HighConcurrencyTextCleaner(TextCleaner):
+    """
+    Text cleaner optimized for high-concurrency APIs (Kimi Tier 3, DeepSeek unlimited).
+    Dynamically adjusts concurrency based on service and document size.
+    """
+
+    # Service-specific limits (conservative defaults)
+    SERVICE_LIMITS = {
+        "kimi": {
+            "max_concurrent": 50,     # Conservative: 50 of 200 available
+            "max_tokens_per_minute": 2500000,  # 2.5M of 3M TPM
+            "requests_per_minute": 600,        # 10 RPS
+            "tokens_per_request": 3500,        # Average estimate
+        },
+        "deepseek": {
+            "max_concurrent": 100,    # No official limit, be reasonable
+            "max_tokens_per_minute": float('inf'),  # No limit claimed
+            "requests_per_minute": float('inf'),     # No limit claimed
+            "tokens_per_request": 3500,
+        }
+    }
+
+    def __init__(self, clients: APIClients, config: ProcessingConfig):
+        super().__init__(clients, config)
+        self.service = config.cleanup_model
+        self.limits = self.SERVICE_LIMITS[self.service]
+
+        # Rate limiting state
+        self.token_counter = 0
+        self.request_counter = 0
+        self.window_start = time.time()
+        self.lock = threading.Lock()
+
+        # Performance tracking
+        self.response_times = []
+        self.success_count = 0
+        self.failure_count = 0
+
+    def process_text_in_chunks(self, text: str, context: str = "",
+                              has_ocr_loops: bool = False) -> str:
+        """
+        Main entry point with intelligent parallelization.
+        """
+        chunk_indices = self.create_chunks_with_overlap(text)
+        total_chunks = len(chunk_indices)
+
+        # Decision logic for parallelization
+        if total_chunks <= 3:
+            print(f"📝 Small document ({total_chunks} chunks), using sequential mode")
+            return super().process_text_in_chunks(text, context, has_ocr_loops)
+
+        # Calculate optimal concurrency
+        optimal_workers = self._calculate_optimal_concurrency(total_chunks)
+
+        print(f"🚀 Processing {total_chunks} chunks with {optimal_workers} parallel workers "
+              f"({self.service.upper()})")
+
+        return self._process_high_concurrency(
+            text, chunk_indices, context, has_ocr_loops, optimal_workers
+        )
+
+    def _calculate_optimal_concurrency(self, total_chunks: int) -> int:
+        """Calculate optimal number of workers."""
+        max_concurrent = self.limits["max_concurrent"]
+
+        if total_chunks <= 10:
+            return min(5, total_chunks, max_concurrent)
+
+        if total_chunks <= 50:
+            return min(total_chunks // 2, max_concurrent)
+
+        optimal = min(total_chunks, max_concurrent)
+
+        if len(self.response_times) > 10:
+            avg_time = sum(self.response_times[-10:]) / 10
+            if avg_time > 30:
+                optimal = max(10, optimal // 2)
+                print(f"   ⚡ Reducing concurrency to {optimal} (slow responses)")
+
+        return optimal
+
+    def _process_high_concurrency(self, text: str,
+                                 chunk_indices: List[Tuple[int, int]],
+                                 context: str, has_ocr_loops: bool,
+                                 max_workers: int) -> str:
+        """High-concurrency parallel processing."""
+        total_chunks = len(chunk_indices)
+        start_time = time.time()
+
+        # Prepare all tasks
+        tasks = []
+        for i, (start, end) in enumerate(chunk_indices, 1):
+            chunk_text = text[start:end]
+            is_first_chunk = (i == 1)
+
+            prompt = self._build_chunk_prompt(chunk_text, context, has_ocr_loops, not is_first_chunk)
+
+            tasks.append({
+                'index': i-1,
+                'chunk_text': chunk_text,
+                'prompt': prompt,
+                'is_first_chunk': is_first_chunk,
+                'estimated_tokens': len(chunk_text) * 1.5 + 500
+            })
+
+        # Process in parallel
+        results = self._execute_with_adaptive_concurrency(tasks, max_workers)
+
+        # Combine results
+        combined_text = self._combine_results(results, total_chunks)
+
+        elapsed = time.time() - start_time
+        self._print_performance_summary(elapsed, total_chunks, len(combined_text))
+
+        return combined_text
+
+    def _build_chunk_prompt(self, chunk_text: str, context: str,
+                           has_loops: bool, has_marked_context: bool) -> str:
+        """Build prompt for a single chunk."""
+        # Use the prompt building logic from your existing clean_chunk method
+        # Extract and adapt it here (or call super().clean_chunk with a flag)
+        loop_warning = "\n\n**重要提示**：此文本可能包含OCR识别循环导致的重复内容，请仔细检查并删除所有重复部分。" if has_loops else ""
+
+        base_requirements = """1. 绝对必须保持原文的繁简体字形式。严禁擅自转换字形。
+2. 【核心原则】严格保持所有原文字符不变。**仅在以下三种情况可考虑修正**：
+   a. **字形高度相似且语境完全不通**（如「己」「已」「巳」在明显错误的语境）
+   b. **明显不符合时代特征的用字**（如现代简体字混入明清文献）
+   c. **同一字在文中稳定出现，仅个别处明显误写**（参考上下文一致性）
+   修正时必须选择**最接近原字形**的合理汉字，并在修正处添加【？】标注。
+3. 添加文言文适用的标点符号（句号、逗号、顿号、问号）。
+4. 删除所有机构元数据（如页码、图书馆标记、[空页]等）。
+5. 将文本整理成连贯段落，但**保持原文的章节层次和自然换行**。
+6. 对于无法确定的字，用【？】标注。
+7. **特别注意：如果发现重复出现的文本块（OCR识别循环错误），请删除这些重复部分**。
+8. **如果文本明显不完整或被截断，保持原样即可**。
+9. 【新增】**对于古汉语中的异体字、通假字、避讳字等，即使看起来不常见，也必须保留原字**。
+
+重要提醒：当不确定是否应该修正时，一律选择**保留原字**。"""
+
+        if has_marked_context:
+            context_instruction = """
+
+**重要说明 - 关于上文参考**：
+- 文本开头有 [[上文参考...]] 括起的部分，这是前一段的结尾，已经处理过
+- [[...]] 中的内容仅供你理解上下文，帮助你正确理解接下来的文本
+- **绝对不要在输出中包含或重复 [[...]] 中的任何内容**
+- 只处理并输出 [[...]] 之后的文本
+- 如果 [[...]] 后的文本开头是不完整的句子，请根据上下文理解其含义，但仍然不要输出上文参考的内容
+- 直接从 [[...]] 后面的第一个字开始输出你的处理结果"""
+
+            prompt = f"""请将以下OCR文本整理成连贯的文言文文献。這是明清時期的文獻。
+
+要求：
+{base_requirements}{loop_warning}{context_instruction}
+
+{f"上下文提示：{context}" if context else ""}
+
+待处理文本：
+{chunk_text}
+
+请直接返回整理后的文本，不要包含任何额外的说明、列表或标题，立即开始正文："""
+        else:
+            prompt = f"""请将以下OCR文本整理成连贯的文言文文献。這是明清時期的文獻。
+
+要求：
+{base_requirements}{loop_warning}
+
+{f"上下文提示：{context}" if context else ""}
+
+OCR文本：
+{chunk_text}
+
+请直接返回整理后的文本，不要包含任何额外的说明、列表或标题，立即开始正文："""
+
+        return prompt
+
+    def _execute_with_adaptive_concurrency(self, tasks: List[dict],
+                                          max_workers: int) -> List[dict]:
+        """Execute tasks with adaptive concurrency control."""
+        results = []
+        task_queue = tasks.copy()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {}
+
+            # Initial submission
+            initial_batch = min(max_workers * 2, len(task_queue))
+            for _ in range(initial_batch):
+                if task_queue:
+                    task = task_queue.pop(0)
+                    future = executor.submit(self._process_single_task, task)
+                    future_to_task[future] = task
+
+            # Process completed futures
+            while future_to_task:
+                done, _ = concurrent.futures.wait(
+                    future_to_task.keys(),
+                    timeout=1.0,
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
+
+                for future in done:
+                    task = future_to_task.pop(future)
+
+                    try:
+                        result = future.result(timeout=0)
+                        results.append(result)
+
+                        # Update performance metrics
+                        if 'processing_time' in result:
+                            with self.lock:
+                                self.response_times.append(result['processing_time'])
+                                if len(self.response_times) > 100:
+                                    self.response_times.pop(0)
+
+                        # Submit new task if queue not empty
+                        if task_queue:
+                            next_task = task_queue.pop(0)
+                            new_future = executor.submit(self._process_single_task, next_task)
+                            future_to_task[new_future] = next_task
+
+                    except Exception as e:
+                        print(f"   ✗ Task {task['index']+1} failed: {e}")
+                        results.append({
+                            'index': task['index'],
+                            'result': task['chunk_text'],
+                            'status': 'failed'
+                        })
+
+        return results
+
+    def _process_single_task(self, task: dict) -> dict:
+        """Process a single task with rate limiting."""
+        task_idx = task['index'] + 1
+        start_time = time.time()
+
+        # Apply rate limiting if needed
+        self._apply_rate_limits(task['estimated_tokens'])
+
+        for attempt in range(self.config.retry_attempts):
+            try:
+                client, model = self._get_cleanup_client_and_model()
+
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": task['prompt']}],
+                    timeout=self.config.api_timeout,
+                    max_tokens=2048
+                )
+
+                processing_time = time.time() - start_time
+                result = self.sanitize_output(response.choices[0].message.content)
+
+                # Update rate limiting counters
+                self._update_counters(task['estimated_tokens'])
+
+                # Print progress
+                with self.lock:
+                    self.success_count += 1
+                    print(f"   ✓ Chunk {task_idx} ({processing_time:.1f}s)", flush=True)
+
+                return {
+                    'index': task['index'],
+                    'result': result,
+                    'status': 'success',
+                    'processing_time': processing_time
+                }
+
+            except Exception as e:
+                if attempt < self.config.retry_attempts - 1:
+                    wait_time = self.config.retry_delay * (2 ** attempt)
+                    print(f"   ⚠️ Chunk {task_idx} retry {attempt+1}: {e}")
+                    time.sleep(wait_time)
+                else:
+                    with self.lock:
+                        self.failure_count += 1
+                        print(f"   ✗ Chunk {task_idx} failed after retries")
+
+                    return {
+                        'index': task['index'],
+                        'result': task['chunk_text'],
+                        'status': 'failed',
+                        'error': str(e)
+                    }
+
+    def _apply_rate_limits(self, estimated_tokens: int):
+        """Apply rate limits (Kimi only)."""
+        if self.service != "kimi":
+            return
+
+        current_time = time.time()
+        window_elapsed = current_time - self.window_start
+
+        if window_elapsed > 60:
+            with self.lock:
+                self.token_counter = 0
+                self.request_counter = 0
+                self.window_start = current_time
+            return
+
+        with self.lock:
+            projected_tokens = self.token_counter + estimated_tokens
+
+            if projected_tokens > self.limits["max_tokens_per_minute"]:
+                tokens_over = projected_tokens - self.limits["max_tokens_per_minute"]
+                wait_time = (tokens_over / self.limits["max_tokens_per_minute"]) * 60
+                wait_time = min(wait_time, 60 - window_elapsed)
+
+                if wait_time > 0.1:
+                    print(f"   ⏳ TPM limit: waiting {wait_time:.1f}s")
+                    time.sleep(wait_time)
+
+                self.token_counter = 0
+                self.window_start = time.time()
+
+    def _update_counters(self, tokens_used: int):
+        """Update rate limiting counters."""
+        if self.service != "kimi":
+            return
+
+        with self.lock:
+            self.token_counter += tokens_used
+            self.request_counter += 1
+
+    def _combine_results(self, results: List[dict], total_chunks: int) -> str:
+        """Combine and deduplicate results."""
+        sorted_results = sorted(results, key=lambda x: x['index'])
+        cleaned_chunks = [r['result'] for r in sorted_results]
+
+        print(f"\n🔗 Combining {len(cleaned_chunks)} results with deduplication...")
+
+        if len(cleaned_chunks) <= 1:
+            return cleaned_chunks[0] if cleaned_chunks else ""
+
+        deduped_chunks = [cleaned_chunks[0]]
+
+        for i in range(1, len(cleaned_chunks)):
+            prev_chunk = deduped_chunks[-1]
+            curr_chunk = cleaned_chunks[i]
+
+            duplicate_len = self.detect_overlap_duplicate(
+                prev_tail=prev_chunk[-800:],
+                curr_head=curr_chunk[:800],
+                threshold=0.85,
+                min_length=200
+            )
+
+            if duplicate_len > 0:
+                print(f"   Removed {duplicate_len}-char duplicate between chunks {i}→{i+1}")
+                deduped_chunks.append(curr_chunk[duplicate_len:])
+            else:
+                deduped_chunks.append(curr_chunk)
+
+        combined = '\n\n'.join(deduped_chunks)
+
+        failed_count = sum(1 for r in results if r['status'] == 'failed')
+        if failed_count > 0:
+            print(f"⚠️  Warning: {failed_count} chunks failed and used original text")
+
+        return combined
+
+    def _print_performance_summary(self, elapsed: float,
+                                  total_chunks: int, output_chars: int):
+        """Print performance summary."""
+        chars_per_sec = output_chars / elapsed if elapsed > 0 else 0
+
+        print(f"\n{'='*60}")
+        print(f"🚀 PARALLEL PROCESSING COMPLETE")
+        print(f"{'='*60}")
+        print(f"   Service:        {self.service.upper()}")
+        print(f"   Total time:     {elapsed:.1f}s")
+        print(f"   Chunks:         {total_chunks}")
+        print(f"   Output length:  {output_chars} chars")
+        print(f"   Throughput:     {chars_per_sec:.0f} chars/sec")
+        print(f"   Success rate:   {self.success_count}/{total_chunks} chunks")
+
+        if self.response_times:
+            avg_time = sum(self.response_times) / len(self.response_times)
+            print(f"   Avg response:   {avg_time:.1f}s")
+
+        print(f"{'='*60}")
 
 # ============================================================================
 # DOCUMENT PROCESSOR
@@ -637,23 +1267,23 @@ class DocumentProcessor:
 
     def __init__(self, config: ProcessingConfig):
         self.config = config
-        self.clients = APIClients()
+        self.clients = APIClients(cleanup_model=config.cleanup_model)
         self.ocr_engine = OCREngine(self.clients, config)
-        self.text_cleaner = TextCleaner(self.clients, config)
+        self.text_cleaner = HighConcurrencyTextCleaner(self.clients, config)
         self.zotero = ZoteroExporter()
 
     def process_image(self, image_path: str, context: str = "",
                      output_dir: str = "./processed",
-                     quick_mode: bool = False) -> Optional[Path]:
+                     review_mode: bool = False) -> Optional[Path]:
         """Process a single image file"""
-        print(f"\n{'='*60}")
-        print(f"Processing image: {image_path}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Processing image: {image_path}", flush=True)
+        print(f"{'='*60}", flush=True)
 
         # OCR
         result = self.ocr_engine.process_image(image_path, 1, 1)
         if not result:
-            print("❌ OCR failed")
+            print("❌ OCR failed", flush=True)
             return None
 
         raw_text, has_loops = result
@@ -663,39 +1293,48 @@ class DocumentProcessor:
         doc_name = Path(image_path).stem
 
         # Clean text
-        print("\n=== Text Cleaning Stage ===")
+        print("\n=== Text Cleaning Stage ===", flush=True)
         cleaned_text = self.text_cleaner.process_text_in_chunks(raw_text, context, has_loops)
 
-        # Final polish
-        if not quick_mode:
-            cleaned_text = self.text_cleaner.final_polish(cleaned_text, context)
-
-        # Create consolidated note
+        # Save markdown (ALWAYS)
         pages_with_loops = [1] if has_loops else []
-
         output_path = self._create_consolidated_note(
             doc_name, cleaned_text, pages_with_loops,
             output_dir, context, 1
         )
+        print(f"✓ Markdown saved: {output_path}", flush=True)
 
-        print(f"\n✓ Processing complete: {output_path}")
+        # Optional: Generate quality review report
+        if review_mode:
+            review_report = self.text_cleaner.generate_review_report(cleaned_text, context)
+            review_path = Path(output_dir) / f"{doc_name}_review.txt"
+            with open(review_path, 'w', encoding='utf-8') as f:
+                f.write(f"# 质量审查报告\n\n")
+                f.write(f"文档: {doc_name}\n")
+                f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"文本长度: {len(cleaned_text)} 字符\n\n")
+                f.write("="*60 + "\n\n")
+                f.write(review_report)
+            print(f"✓ Review report saved: {review_path}", flush=True)
+
+        print(f"\n✓ Processing complete: {output_path}", flush=True)
         return output_path
 
     def process_pdf(self, pdf_path: str, context: str = "",
                    output_dir: str = "./processed",
-                   quick_mode: bool = False, max_pages: Optional[int] = None,
+                   review_mode: bool = False, max_pages: Optional[int] = None,
                    start_page: int = 1,
                    export_zotero: bool = False,
                    zotero_title: Optional[str] = None,
                    zotero_collection: Optional[str] = None) -> Optional[Path]:
         """Process a PDF file"""
-        print(f"\n{'='*60}")
-        print(f"Processing PDF: {pdf_path}")
-        print(f"Output directory: {output_dir}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Processing PDF: {pdf_path}", flush=True)
+        print(f"Output directory: {output_dir}", flush=True)
+        print(f"{'='*60}", flush=True)
 
         if not PDF_SUPPORT:
-            print("❌ PDF support not available")
+            print("❌ PDF support not available", flush=True)
             return None
 
         try:
@@ -705,24 +1344,27 @@ class DocumentProcessor:
             end_page = min(start_page + max_pages - 1, total_pages) if max_pages else total_pages
             page_count = end_page - start_page + 1
 
-            print(f"Total PDF pages: {total_pages}")
-            print(f"Processing pages {start_page} to {end_page} ({page_count} pages)")
-            print(f"DPI: {self.config.ocr_dpi}, Model: {self.config.qwen_model}")
+            print(f"Total PDF pages: {total_pages}", flush=True)
+            print(f"Processing pages {start_page} to {end_page} ({page_count} pages)", flush=True)
+            print(f"DPI: {self.config.ocr_dpi}, Model: {self.config.qwen_model}", flush=True)
 
             # Create output directory
             os.makedirs(output_dir, exist_ok=True)
             doc_name = Path(pdf_path).stem
 
             # OCR Stage
-            print("\n" + "="*60)
-            print("STAGE 1: OCR EXTRACTION")
-            print("="*60)
+            print("\n" + "="*60, flush=True)
+            print("STAGE 1: OCR EXTRACTION", flush=True)
+            print("="*60, flush=True)
 
             all_ocr_texts = []
             pages_with_loops = []
             start_time = time.time()
 
+            current_page_index = 0
             for page_num in range(start_page, end_page + 1):
+                current_page_index += 1
+
                 # Convert single page
                 images = convert_from_path(
                     pdf_path,
@@ -732,7 +1374,7 @@ class DocumentProcessor:
                 )
 
                 if not images:
-                    print(f"⚠️  Skipping page {page_num} - conversion failed")
+                    print(f"⚠️  Skipping page {page_num} - conversion failed", flush=True)
                     continue
 
                 # Save as temporary image
@@ -740,8 +1382,8 @@ class DocumentProcessor:
                 images[0].save(temp_image.name, 'PNG')
 
                 try:
-                    # Process with OCR
-                    result = self.ocr_engine.process_image(temp_image.name, page_num, page_count)
+                    # Process with OCR (pass current index for accurate progress)
+                    result = self.ocr_engine.process_image(temp_image.name, page_num, page_count, current_page_index)
                     if result:
                         text, has_loops = result
                         all_ocr_texts.append(text)
@@ -755,14 +1397,14 @@ class DocumentProcessor:
             ocr_time = time.time() - start_time
 
             if not all_ocr_texts:
-                print("❌ No text extracted from any pages")
+                print("❌ No text extracted from any pages", flush=True)
                 return None
 
             # Combine OCR texts
             combined_ocr = '\n\n'.join(all_ocr_texts)
-            print(f"\n✓ OCR complete: {len(combined_ocr)} chars from {len(all_ocr_texts)} pages")
-            print(f"   Time: {ocr_time:.1f}s")
-            print(f"   Pages with loops: {len(pages_with_loops)}")
+            print(f"\n✓ OCR complete: {len(combined_ocr)} chars from {len(all_ocr_texts)} pages", flush=True)
+            print(f"   Time: {ocr_time:.1f}s", flush=True)
+            print(f"   Pages with loops: {len(pages_with_loops)}", flush=True)
 
             # Save OCR backup
             backup_data = {
@@ -782,37 +1424,51 @@ class DocumentProcessor:
             backup_path = Path(output_dir) / f"{doc_name}_raw_ocr_latest.json"
             with open(backup_path, 'w', encoding='utf-8') as f:
                 json.dump(backup_data, f, ensure_ascii=False, indent=2)
-            print(f"   Backup saved: {backup_path}")
+            print(f"   Backup saved: {backup_path}", flush=True)
 
             # Cleaning Stage
-            print("\n" + "="*60)
-            print("STAGE 2: TEXT CLEANING")
-            print("="*60)
+            print("\n" + "="*60, flush=True)
+            print("STAGE 2: TEXT CLEANING", flush=True)
+            print("="*60, flush=True)
 
             has_loops = len(pages_with_loops) > 0
             cleaned_text = self.text_cleaner.process_text_in_chunks(
                 combined_ocr, context, has_loops
             )
 
-            # Final polish
-            if not quick_mode:
-                cleaned_text = self.text_cleaner.final_polish(cleaned_text, context)
+            # Save markdown after Stage 2 (ALWAYS - prevents data loss)
+            print("\n" + "="*60, flush=True)
+            print("SAVING OUTPUT", flush=True)
+            print("="*60, flush=True)
 
-            # Create consolidated note
             output_path = self._create_consolidated_note(
                 doc_name, cleaned_text, pages_with_loops,
                 output_dir, context, page_count
             )
+            print(f"✓ Markdown saved: {output_path}", flush=True)
+
+            # Optional: Generate quality review report
+            if review_mode:
+                review_report = self.text_cleaner.generate_review_report(cleaned_text, context)
+                review_path = Path(output_dir) / f"{doc_name}_review.txt"
+                with open(review_path, 'w', encoding='utf-8') as f:
+                    f.write(f"# 质量审查报告\n\n")
+                    f.write(f"文档: {doc_name}\n")
+                    f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"文本长度: {len(cleaned_text)} 字符\n\n")
+                    f.write("="*60 + "\n\n")
+                    f.write(review_report)
+                print(f"✓ Review report saved: {review_path}", flush=True)
 
             total_time = time.time() - start_time
-            print(f"\n{'='*60}")
-            print(f"✓ Processing complete in {total_time:.1f}s")
-            print(f"✓ Output: {output_path}")
-            print(f"{'='*60}")
+            print(f"\n{'='*60}", flush=True)
+            print(f"✓ Processing complete in {total_time:.1f}s", flush=True)
+            print(f"✓ Output: {output_path}", flush=True)
+            print(f"{'='*60}", flush=True)
 
             # Export to Zotero if requested
             if export_zotero:
-                print(f"\n📚 Exporting to Zotero...")
+                print(f"\n📚 Exporting to Zotero...", flush=True)
                 collection_key = None
                 if zotero_collection:
                     collection_key = self.zotero.get_collection_key(zotero_collection)
@@ -829,21 +1485,21 @@ class DocumentProcessor:
             return output_path
 
         except Exception as e:
-            print(f"❌ Error processing PDF: {e}")
+            print(f"❌ Error processing PDF: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
 
     def resume_from_backup(self, backup_path: str, context: str = "",
                           output_dir: str = "./processed",
-                          quick_mode: bool = False,
+                          review_mode: bool = False,
                           export_zotero: bool = False,
                           zotero_title: Optional[str] = None,
                           zotero_collection: Optional[str] = None):
         """Resume processing from a raw OCR backup file"""
-        print(f"\n{'='*60}")
-        print(f"Resuming from backup: {backup_path}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Resuming from backup: {backup_path}", flush=True)
+        print(f"{'='*60}", flush=True)
 
         try:
             with open(backup_path, 'r', encoding='utf-8') as f:
@@ -858,35 +1514,51 @@ class DocumentProcessor:
             # Use provided context or fall back to saved context
             final_context = context if context else saved_context
 
-            print(f"Document: {doc_name}")
-            print(f"Text length: {len(combined_ocr)} chars")
-            print(f"Pages with loops: {len(pages_with_loops)}")
+            print(f"Document: {doc_name}", flush=True)
+            print(f"Text length: {len(combined_ocr)} chars", flush=True)
+            print(f"Pages with loops: {len(pages_with_loops)}", flush=True)
 
             # Cleaning Stage
-            print("\n" + "="*60)
-            print("STAGE 2: TEXT CLEANING (RESUMED)")
-            print("="*60)
+            print("\n" + "="*60, flush=True)
+            print("STAGE 2: TEXT CLEANING (RESUMED)", flush=True)
+            print("="*60, flush=True)
+            print("", flush=True)  # Empty line for readability
 
             has_loops = len(pages_with_loops) > 0
+            print("Starting text chunking and cleaning...", flush=True)
             cleaned_text = self.text_cleaner.process_text_in_chunks(
                 combined_ocr, final_context, has_loops
             )
 
-            # Final polish
-            if not quick_mode:
-                cleaned_text = self.text_cleaner.final_polish(cleaned_text, final_context)
+            # Save markdown (ALWAYS)
+            print("\n" + "="*60, flush=True)
+            print("SAVING OUTPUT", flush=True)
+            print("="*60, flush=True)
 
-            # Create consolidated note
             output_path = self._create_consolidated_note(
                 doc_name, cleaned_text, pages_with_loops,
                 output_dir, final_context, page_count
             )
+            print(f"✓ Markdown saved: {output_path}", flush=True)
 
-            print(f"\n✓ Resume processing complete: {output_path}")
+            # Optional: Generate quality review report
+            if review_mode:
+                review_report = self.text_cleaner.generate_review_report(cleaned_text, final_context)
+                review_path = Path(output_dir) / f"{doc_name}_review.txt"
+                with open(review_path, 'w', encoding='utf-8') as f:
+                    f.write(f"# 质量审查报告\n\n")
+                    f.write(f"文档: {doc_name}\n")
+                    f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"文本长度: {len(cleaned_text)} 字符\n\n")
+                    f.write("="*60 + "\n\n")
+                    f.write(review_report)
+                print(f"✓ Review report saved: {review_path}", flush=True)
+
+            print(f"\n✓ Resume processing complete: {output_path}", flush=True)
 
             # Export to Zotero if requested
             if export_zotero:
-                print(f"\n📚 Exporting to Zotero...")
+                print(f"\n📚 Exporting to Zotero...", flush=True)
                 collection_key = None
                 if zotero_collection:
                     collection_key = self.zotero.get_collection_key(zotero_collection)
@@ -904,7 +1576,7 @@ class DocumentProcessor:
             return output_path
 
         except Exception as e:
-            print(f"❌ Error resuming from backup: {e}")
+            print(f"❌ Error resuming from backup: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
@@ -996,7 +1668,7 @@ tags:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(note_content)
 
-        print(f"\n✓ Created consolidated note: {output_path}")
+        print(f"\n✓ Created consolidated note: {output_path}", flush=True)
         return output_path
 
 # ============================================================================
@@ -1006,7 +1678,7 @@ tags:
 def create_argument_parser() -> argparse.ArgumentParser:
     """Create command line argument parser"""
     parser = argparse.ArgumentParser(
-        description='Process classical Chinese documents with Qwen-VL and Kimi',
+        description='Process classical Chinese documents with AI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1016,11 +1688,14 @@ Examples:
   # Process PDF with context
   %(prog)s document.pdf --context "明代文集，竖排无标点" --output ~/Obsidian/Primary-Sources/
 
-  # Quick mode (skip final polish)
-  %(prog)s document.pdf --quick --output ./processed
+  # Generate quality review report (optional)
+  %(prog)s document.pdf --review --output ./processed
 
-  # Use faster/cheaper model
-  %(prog)s document.pdf --model qwen-vl-plus --output ./processed
+  # Use alternative OCR model
+  %(prog)s document.pdf --model qwen-vl-max --output ./processed
+
+  # Use DeepSeek for text cleanup (cheaper alternative to Kimi)
+  %(prog)s document.pdf --cleanup-model deepseek --output ./processed
 
   # Process pages 50-100 only
   %(prog)s document.pdf --start-page 50 --max-pages 51 --output ./processed
@@ -1038,7 +1713,13 @@ Examples:
   %(prog)s document.pdf --zotero --zotero-collection "Primary Sources" --output ./processed
 
   # Batch process directory
-  %(prog)s ./scans/ --batch --context "泉州府志" --output ~/Obsidian/Primary-Sources/
+  %(prog)s ./scans/ --batch --context "泉州府志" --output ~/Obsidian/Primary-Sources
+
+  # Force sequential processing (for debugging)
+  %(prog)s document.pdf --sequential --output ./processed
+
+  # Limit maximum concurrent requests
+  %(prog)s document.pdf --max-concurrent 20 --output ./processed
 """
     )
 
@@ -1046,12 +1727,16 @@ Examples:
     parser.add_argument('--context', default='', help='Contextual information')
     parser.add_argument('--output', default='./processed', help='Output directory')
     parser.add_argument('--batch', action='store_true', help='Process all files in directory')
-    parser.add_argument('--dpi', type=int, default=200, help='DPI for PDF conversion')
-    parser.add_argument('--model', default='qwen-vl-max', choices=['qwen-vl-plus', 'qwen-vl-max'], help='Qwen model')
-    parser.add_argument('--quick', action='store_true', help='Skip final polish step')
+    parser.add_argument('--dpi', type=int, default=300, help='DPI for PDF conversion (default: 300 for optimal OCR)')
+    parser.add_argument('--model', default='qwen3-vl-plus', choices=['qwen3-vl-plus', 'qwen-vl-max'], help='Qwen OCR model')
+    parser.add_argument('--cleanup-model', default='deepseek', choices=['kimi', 'deepseek'], help='Text cleanup model (default: deepseek)')
+    parser.add_argument('--review', action='store_true', help='Generate quality review report after processing')
     parser.add_argument('--max-pages', type=int, help='Limit processing to first N pages')
     parser.add_argument('--start-page', type=int, default=1, help='Start processing from page N (default: 1)')
+    parser.add_argument('--end-page', type=int, help='Last page to process (alternative to max-pages)')
     parser.add_argument('--resume-from', help='Resume from raw OCR JSON file')
+    parser.add_argument('--sequential', action='store_true', help='Force sequential processing (disables parallel)')
+    parser.add_argument('--max-concurrent', type=int, default=None, help='Maximum concurrent requests (default: auto-detected)')
     parser.add_argument('--zotero', action='store_true', help='Export to Zotero after processing')
     parser.add_argument('--zotero-title', help='Custom title for Zotero item (defaults to filename)')
     parser.add_argument('--zotero-collection', help='Zotero collection name to file the item in')
@@ -1071,16 +1756,34 @@ def main():
     config = ProcessingConfig()
     config.update_from_args(args)
 
+    # Define start and end pages
+    if args.end_page:
+        if args.start_page:
+            # If both start and end specified, calculate max_pages
+            args.max_pages = args.end_page - args.start_page + 1
+        else:
+            # If only end specified, process from page 1 to end
+            args.max_pages = args.end_page
+
     # Initialize processor
     processor = DocumentProcessor(config)
+
+    # Handle sequential mode by replacing text cleaner
+    if args.sequential:
+        print("⚠️  Sequential mode forced (--sequential flag)", flush=True)
+        processor.text_cleaner = TextCleaner(processor.clients, config)
+    # Apply max_concurrent override if specified
+    elif args.max_concurrent:
+        processor.text_cleaner.limits["max_concurrent"] = args.max_concurrent
+        print(f"⚙️  Concurrency limit set to {args.max_concurrent} workers", flush=True)
 
     # Handle resume case
     if args.resume_from:
         if not Path(args.resume_from).exists():
-            print(f"❌ Error: Backup file {args.resume_from} not found")
+            print(f"❌ Error: Backup file {args.resume_from} not found", flush=True)
             sys.exit(1)
         processor.resume_from_backup(
-            args.resume_from, args.context, args.output, args.quick,
+            args.resume_from, args.context, args.output, args.review,
             export_zotero=args.zotero,
             zotero_title=args.zotero_title,
             zotero_collection=args.zotero_collection
@@ -1089,31 +1792,31 @@ def main():
 
     # Validate input
     if not args.input:
-        print("❌ Error: Input file or directory required when not using --resume-from")
+        print("❌ Error: Input file or directory required when not using --resume-from", flush=True)
         sys.exit(1)
 
     # Batch processing
     if args.batch:
         input_path = Path(args.input)
         if not input_path.is_dir():
-            print(f"❌ Error: {args.input} is not a directory")
+            print(f"❌ Error: {args.input} is not a directory", flush=True)
             sys.exit(1)
 
         images = list(input_path.glob('*.jpg')) + list(input_path.glob('*.png')) + list(input_path.glob('*.jpeg'))
         pdfs = list(input_path.glob('*.pdf'))
 
         if not images and not pdfs:
-            print(f"❌ No images or PDFs found in {args.input}")
+            print(f"❌ No images or PDFs found in {args.input}", flush=True)
             sys.exit(1)
 
-        print(f"Found {len(images)} image(s) and {len(pdfs)} PDF(s) to process\n")
-        print("=" * 60)
+        print(f"Found {len(images)} image(s) and {len(pdfs)} PDF(s) to process\n", flush=True)
+        print("=" * 60, flush=True)
 
         successful = 0
         failed = 0
 
         for img in images:
-            result = processor.process_image(str(img), args.context, args.output, args.quick)
+            result = processor.process_image(str(img), args.context, args.output, args.review)
             if result:
                 successful += 1
             else:
@@ -1121,7 +1824,7 @@ def main():
 
         for pdf in pdfs:
             result = processor.process_pdf(
-                str(pdf), args.context, args.output, args.quick, 
+                str(pdf), args.context, args.output, args.review, 
                 args.max_pages, args.start_page,
                 export_zotero=args.zotero,
                 zotero_title=args.zotero_title,
@@ -1132,34 +1835,34 @@ def main():
             else:
                 failed += 1
 
-        print("=" * 60)
-        print(f"\n📊 Processing complete:")
-        print(f"   ✓ Successful: {successful}")
-        print(f"   ✗ Failed: {failed}")
+        print("=" * 60, flush=True)
+        print(f"\n📊 Processing complete:", flush=True)
+        print(f"   ✓ Successful: {successful}", flush=True)
+        print(f"   ✗ Failed: {failed}", flush=True)
 
     else:
         # Single file processing
         if not Path(args.input).exists():
-            print(f"❌ Error: File {args.input} not found")
+            print(f"❌ Error: File {args.input} not found", flush=True)
             sys.exit(1)
 
         file_ext = Path(args.input).suffix.lower()
         if file_ext == '.pdf':
             if not PDF_SUPPORT:
-                print("❌ Error: PDF support not available")
-                print("   Install with: pip install pdf2image")
+                print("❌ Error: PDF support not available", flush=True)
+                print("   Install with: pip install pdf2image", flush=True)
                 sys.exit(1)
             processor.process_pdf(
-                args.input, args.context, args.output, args.quick, 
+                args.input, args.context, args.output, args.review, 
                 args.max_pages, args.start_page,
                 export_zotero=args.zotero,
                 zotero_title=args.zotero_title,
                 zotero_collection=args.zotero_collection
             )
         else:
-            processor.process_image(args.input, args.context, args.output, args.quick)
+            processor.process_image(args.input, args.context, args.output, args.review)
 
-        print("\n✓ Processing complete!")
+        print("\n✓ Processing complete!", flush=True)
 
 if __name__ == "__main__":
     main()

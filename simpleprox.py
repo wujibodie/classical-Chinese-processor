@@ -2,7 +2,7 @@
 """
 Modern Classical Chinese PDF to Markdown Converter
 A streamlined tool for converting modern editions of classical Chinese texts to markdown.
-Revised for memory safety and robust error handling.
+Revised for memory safety, robust error handling, and Electron app compatibility.
 """
 
 import sys
@@ -26,7 +26,7 @@ try:
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
-    print("⚠️  Warning: pdf2image not installed. PDF support disabled.")
+    print("⚠️  Warning: pdf2image not installed. PDF support disabled.", flush=True)
 
 try:
     import cv2
@@ -34,7 +34,7 @@ try:
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
-    print("⚠️  Warning: opencv-python not installed. Image preprocessing disabled.")
+    print("⚠️  Warning: opencv-python not installed. Image preprocessing disabled.", flush=True)
 
 # ============================================================================
 # CONFIGURATION
@@ -44,9 +44,9 @@ class Config:
     """Simplified configuration for modern text processing"""
 
     # OCR Settings
-    ocr_dpi: int = 300  # Higher DPI for modern printed text
-    qwen_model: str = "qwen-vl-max"
-    max_image_width: int = 1536  # Higher resolution for modern text
+    ocr_dpi: int = 300  # Optimal DPI for character detail
+    qwen_model: str = "qwen3-vl-plus"
+    max_image_width: int = 3072  # 300 DPI at A4 width with margins
 
     # Text Processing
     api_timeout: int = 60
@@ -66,7 +66,7 @@ class APIClient:
 
     def __init__(self):
         if not os.getenv("DASHSCOPE_API_KEY"):
-            print("❌ Error: DASHSCOPE_API_KEY environment variable not set")
+            print("❌ Error: DASHSCOPE_API_KEY environment variable not set", flush=True)
             sys.exit(1)
 
         self.client = OpenAI(
@@ -112,7 +112,7 @@ class ImageProcessor:
             return temp_file.name
 
         except Exception as e:
-            print(f"Preprocessing error: {e}")
+            print(f"Preprocessing error: {e}", flush=True)
             return image_path
 
 # ============================================================================
@@ -149,7 +149,7 @@ class TextProcessor:
                 continue
             second_occurrence = text.find(sample, i+100)
             if second_occurrence != -1:
-                print(f"    ⚠️  Possible loop detected around char {i}. Preserving full text.")
+                print(f"    ⚠️  Possible loop detected around char {i}. Preserving full text.", flush=True)
                 # Return full text to be safe
                 return text
         return text
@@ -189,7 +189,7 @@ class PDFProcessor:
                 return temp_file.name
             return None
         except Exception as e:
-            print(f"Error converting page {page_num}: {e}")
+            print(f"Error converting page {page_num}: {e}", flush=True)
             return None
 
 # ============================================================================
@@ -213,12 +213,19 @@ class OCREngine:
             except Exception as e:
                 if attempt == self.config.retry_attempts - 1:
                     raise e
-                print(f"API call failed (attempt {attempt + 1}/{self.config.retry_attempts}): {e}")
+                print(f"API call failed (attempt {attempt + 1}/{self.config.retry_attempts}): {e}", flush=True)
                 time.sleep(self.config.retry_delay * (2 ** attempt))  # Exponential backoff
 
-    def process_image(self, image_path: str, page_num: int) -> Optional[str]:
+    def process_image(self, image_path: str, page_num: int, total_pages: int = 0, context: str = "", current_index: int = None) -> Optional[str]:
         """Process a single image and return extracted text"""
-        print(f"Processing page {page_num}...", end=' ', flush=True)
+        # Format progress string to match cc-prox.py format for Electron app compatibility
+        # Use current_index for progress calculation if provided, otherwise fall back to page_num
+        progress_index = current_index if current_index is not None else page_num
+        if total_pages > 0:
+            pct = progress_index * 100 // total_pages
+            print(f"\n--- Page {page_num} ({progress_index}/{total_pages}, {pct}%) ---", flush=True)
+        else:
+            print(f"\n--- Page {page_num} ---", flush=True)
 
         try:
             # Preprocess image
@@ -230,6 +237,26 @@ class OCREngine:
                 with open(processed_path, 'rb') as image_file:
                     image_content = base64.b64encode(image_file.read()).decode('utf-8')
 
+                # Build prompt - include context if provided
+                prompt_text = (
+                    "请提取图片中的所有文言文文字。图片格式为竖排、从右至左的现代印刷版本，已有标点符号。要求：\n"
+                    "1. 按照从右至左、从上至下的顺序准确识别所有文字\n"
+                    "2. **绝对必须保持原文的繁简体字形式**。严禁擅自转换字形\n"
+                    "3. 保持原文的段落结构和换行\n"
+                    "4. 保留所有标点符号（句读、引号等）\n"
+                    "5. 不要添加任何解释、注释或说明\n"
+                    "6. 不要修改或润色原文\n"
+                    "7. 如果页面没有文字内容，输出'[空页]'\n"
+                    "8. 如果页面主要是图、表、地图、图表等非文字内容，简单描述后输出'[图: 简短描述]'或'[表: 简短描述]'\n"
+                    "9. 如果遇到难以识别的内容，不要重复输出，标注'[难以识别]'即可\n"
+                    "10. 直接输出文字内容，不要添加任何标题或说明\n"
+                )
+                
+                if context:
+                    prompt_text += f"\n上下文提示：{context}\n"
+                
+                prompt_text += "\n请开始提取："
+
                 # Send to Qwen-VL API for OCR
                 response = self._api_call_with_retry(
                     self.client.client.chat.completions.create,
@@ -239,19 +266,7 @@ class OCREngine:
                         "content": [
                             {
                                 "type": "text",
-                                "text": (
-                                    "请提取图片中的所有文言文文字。图片格式为竖排、从右至左的现代印刷版本，已有标点符号。要求：\n"
-                                    "1. 按照从右至左、从上至下的顺序准确识别所有文字\n"
-                                    "2. 保持原文的段落结构和换行\n"
-                                    "3. 保留所有标点符号（句读、引号等）\n"
-                                    "4. 不要添加任何解释、注释或说明\n"
-                                    "5. 不要修改或润色原文\n"
-                                    "6. 如果页面没有文字内容，输出'[空页]'\n"
-                                    "7. 如果页面主要是图、表、地图、图表等非文字内容，简单描述后输出'[图: 简短描述]'或'[表: 简短描述]'\n"
-                                    "8. 如果遇到难以识别的内容，不要重复输出，标注'[难以识别]'即可\n"
-                                    "9. 直接输出文字内容，不要添加任何标题或说明\n\n"
-                                    "请开始提取："
-                                )
+                                "text": prompt_text
                             },
                             {
                                 "type": "image_url",
@@ -268,10 +283,10 @@ class OCREngine:
 
                 # Check for excessive length
                 if char_count > self.config.ocr_soft_cap:
-                    print(f"⚠️  Long page: {char_count} chars", end=' ')
+                    print(f"  ⚠️  Long page: {char_count} chars", flush=True)
 
                 if char_count > self.config.ocr_hard_cap:
-                    print(f"🔴 Truncating to {self.config.ocr_hard_cap}", end=' ')
+                    print(f"  🔴 Truncating to {self.config.ocr_hard_cap}", flush=True)
                     text = text[:self.config.ocr_hard_cap]
 
                 # Detect loops (Logging only, non-destructive)
@@ -279,7 +294,7 @@ class OCREngine:
                 if has_loops:
                     text = self.text_processor.truncate_at_loop(text, max_length=1500)
 
-                print(f"✓ ({len(text)} chars)")
+                print(f"  ✓ OCR success ({len(text)} chars)", flush=True)
                 return text
 
             finally:
@@ -291,7 +306,7 @@ class OCREngine:
                         pass
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"  ❌ Error: {e}", flush=True)
             return None
 
 # ============================================================================
@@ -312,7 +327,6 @@ class ZoteroExporter:
 
         try:
             headers = {"Zotero-API-Key": api_key}
-            # FIX: Added limit=100 to catch more collections
             response = requests.get(
                 f"https://api.zotero.org/users/{user_id}/collections",
                 headers=headers,
@@ -327,11 +341,11 @@ class ZoteroExporter:
                 if collection['data']['name'] == collection_name:
                     return collection['data']['key']
 
-            print(f"⚠️  Collection '{collection_name}' not found (checked first 100)")
+            print(f"⚠️  Collection '{collection_name}' not found (checked first 100)", flush=True)
             return None
 
         except Exception as e:
-            print(f"❌ Error looking up collection: {e}")
+            print(f"❌ Error looking up collection: {e}", flush=True)
             return None
 
     @staticmethod
@@ -347,7 +361,7 @@ class ZoteroExporter:
         user_id = os.getenv("ZOTERO_USER_ID")
 
         if not api_key or not user_id:
-            print("⚠️  Warning: ZOTERO_API_KEY or ZOTERO_USER_ID not set. Skipping Zotero export.")
+            print("⚠️  Warning: ZOTERO_API_KEY or ZOTERO_USER_ID not set. Skipping Zotero export.", flush=True)
             return None
 
         try:
@@ -388,13 +402,13 @@ class ZoteroExporter:
             )
 
             if response.status_code != 200:
-                print(f"❌ Failed to create Zotero item: {response.status_code}")
-                print(response.text)
+                print(f"❌ Failed to create Zotero item: {response.status_code}", flush=True)
+                print(response.text, flush=True)
                 return None
 
             # Get the created item key
             item_key = response.json()['successful']['0']['key']
-            print(f"✓ Created Zotero item: {item_key}")
+            print(f"✓ Created Zotero item: {item_key}", flush=True)
 
             # Attach markdown file
             with open(markdown_path, 'rb') as f:
@@ -411,14 +425,14 @@ class ZoteroExporter:
             )
 
             if attachment_response.status_code == 200:
-                print(f"✓ Attached markdown file to Zotero item")
+                print(f"✓ Attached markdown file to Zotero item", flush=True)
             else:
-                print(f"⚠️  Warning: Failed to attach file: {attachment_response.status_code}")
+                print(f"⚠️  Warning: Failed to attach file: {attachment_response.status_code}", flush=True)
 
             return item_key
 
         except Exception as e:
-            print(f"❌ Error exporting to Zotero: {e}")
+            print(f"❌ Error exporting to Zotero: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
@@ -430,8 +444,9 @@ class ZoteroExporter:
 class ModernTextProcessor:
     """Main processor for modern classical Chinese texts"""
 
-    def __init__(self):
+    def __init__(self, model: str = "qwen3-vl-plus"):
         self.config = Config()
+        self.config.qwen_model = model
         self.client = APIClient()
         self.ocr_engine = OCREngine(self.client, self.config)
         self.pdf_processor = PDFProcessor()
@@ -439,40 +454,58 @@ class ModernTextProcessor:
 
     def process_pdf(self, pdf_path: str, output_dir: str = "./output",
                    start_page: int = 1, end_page: Optional[int] = None,
+                   max_pages: Optional[int] = None,
+                   context: str = "",
+                   review_mode: bool = False,  # Accepted but not used (simple mode has no review)
                    export_zotero: bool = False,
                    zotero_title: Optional[str] = None,
                    zotero_collection: Optional[str] = None) -> Optional[Path]:
         """Process PDF and create markdown file"""
-        print(f"\n{'='*60}")
-        print(f"Processing: {pdf_path}")
-        print(f"Output directory: {output_dir}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Processing PDF: {pdf_path}", flush=True)
+        print(f"Output directory: {output_dir}", flush=True)
+        print(f"Model: {self.config.qwen_model}", flush=True)
+        if context:
+            print(f"Context: {context}", flush=True)
+        print(f"{'='*60}", flush=True)
 
         try:
             # Get page count
             total_pages = self.pdf_processor.get_page_count(pdf_path)
-            actual_end_page = end_page if end_page else total_pages
+            
+            # Calculate actual end page from various inputs
+            # Priority: end_page > max_pages > total_pages
+            if end_page:
+                actual_end_page = min(end_page, total_pages)
+            elif max_pages:
+                actual_end_page = min(start_page + max_pages - 1, total_pages)
+            else:
+                actual_end_page = total_pages
+                
             page_count = actual_end_page - start_page + 1
 
-            print(f"Total pages: {total_pages}, processing: {page_count}")
-            print("Note: Images are converted and deleted on-the-fly to save disk space.")
+            print(f"Total pages in PDF: {total_pages}", flush=True)
+            print(f"Processing pages {start_page} to {actual_end_page} ({page_count} pages)", flush=True)
+            print("Note: Images are converted and deleted on-the-fly to save disk space.", flush=True)
 
             all_texts = []
             start_time = time.time()
 
-            # FIX: Iterate strictly page by page (Convert -> OCR -> Delete)
+            # Iterate strictly page by page (Convert -> OCR -> Delete)
+            current_page_index = 0
             for page_num in range(start_page, actual_end_page + 1):
-                
+                current_page_index += 1
+
                 # 1. Convert single page
                 img_path = self.pdf_processor.convert_single_page(pdf_path, page_num, self.config)
-                
+
                 if not img_path:
-                    print(f"⚠️  Skipping page {page_num} (conversion failed)")
+                    print(f"⚠️  Skipping page {page_num} (conversion failed)", flush=True)
                     continue
 
                 try:
-                    # 2. OCR single page
-                    text = self.ocr_engine.process_image(img_path, page_num)
+                    # 2. OCR single page (pass current index and total for progress calculation)
+                    text = self.ocr_engine.process_image(img_path, page_num, page_count, context, current_page_index)
                     if text:
                         page_marker = f"<!-- Page {page_num} -->\n\n"
                         all_texts.append((page_num, page_marker + text))
@@ -485,7 +518,7 @@ class ModernTextProcessor:
                             pass
 
             if not all_texts:
-                print("❌ No text extracted")
+                print("❌ No text extracted", flush=True)
                 return None
 
             # Sort by page number and combine texts
@@ -497,24 +530,24 @@ class ModernTextProcessor:
 
             # Generate output filename
             pdf_name = Path(pdf_path).stem
-            if start_page > 1 or end_page:
+            if start_page > 1 or (end_page or max_pages):
                 pdf_name = f"{pdf_name}_p{start_page}-{actual_end_page}"
             output_path = Path(output_dir) / f"{pdf_name}.md"
 
             # Create markdown content
-            markdown_content = self._create_markdown(pdf_path, combined_text, start_page, actual_end_page)
+            markdown_content = self._create_markdown(pdf_path, combined_text, start_page, actual_end_page, context)
 
             # Write to file
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(markdown_content)
 
             processing_time = time.time() - start_time
-            print(f"\n✓ Processing complete in {processing_time:.1f} seconds")
-            print(f"✓ Output saved to: {output_path}")
+            print(f"\n✓ Processing complete in {processing_time:.1f} seconds", flush=True)
+            print(f"✓ Output saved to: {output_path}", flush=True)
 
             # Export to Zotero if requested
             if export_zotero:
-                print(f"\n📚 Exporting to Zotero...")
+                print(f"\n📚 Exporting to Zotero...", flush=True)
                 collection_key = None
                 if zotero_collection:
                     collection_key = self.zotero.get_collection_key(zotero_collection)
@@ -532,12 +565,12 @@ class ModernTextProcessor:
             return output_path
 
         except Exception as e:
-            print(f"❌ Error processing PDF: {e}")
+            print(f"❌ Error processing PDF: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
 
-    def _create_markdown(self, pdf_path: str, text: str, start_page: int, end_page: int) -> str:
+    def _create_markdown(self, pdf_path: str, text: str, start_page: int, end_page: int, context: str = "") -> str:
         """Create markdown content from extracted text"""
         pdf_name = Path(pdf_path).stem
         current_date = datetime.now().strftime('%Y-%m-%d')
@@ -547,6 +580,8 @@ title: {pdf_name}
 source: {Path(pdf_path).name}
 processed: {current_date}
 pages: {start_page}-{end_page}
+ocr-engine: Qwen-VL ({self.config.qwen_model})
+context: {context if context else "None"}
 ---
 
 # {pdf_name}
@@ -561,6 +596,7 @@ pages: {start_page}-{end_page}
 - Pages: {start_page}-{end_page}
 - Processing Date: {current_date}
 - OCR Engine: Qwen-VL ({self.config.qwen_model})
+- Context: {context if context else "None"}
 """
 
 # ============================================================================
@@ -580,8 +616,17 @@ Examples:
   # Process specific pages
   %(prog)s document.pdf --start-page 10 --end-page 20
 
+  # Process first 5 pages only
+  %(prog)s document.pdf --max-pages 5
+
   # Specify output directory
   %(prog)s document.pdf --output ./texts/
+
+  # Use higher quality alternative model
+  %(prog)s document.pdf --model qwen-vl-max
+
+  # Add context for better OCR
+  %(prog)s document.pdf --context "明代福建地方志"
 
   # Export to Zotero
   %(prog)s document.pdf --zotero --zotero-collection "Primary Sources"
@@ -595,6 +640,11 @@ Examples:
     parser.add_argument('--output', default='./output', help='Output directory (default: ./output)')
     parser.add_argument('--start-page', type=int, default=1, help='Start page (default: 1)')
     parser.add_argument('--end-page', type=int, help='End page (default: last page)')
+    parser.add_argument('--max-pages', type=int, help='Maximum number of pages to process (alternative to --end-page)')
+    parser.add_argument('--model', default='qwen3-vl-plus', choices=['qwen3-vl-plus', 'qwen-vl-max'],
+                        help='Qwen model to use (default: qwen3-vl-plus)')
+    parser.add_argument('--context', default='', help='Context information to help OCR (e.g., "明代地方志")')
+    parser.add_argument('--review', action='store_true', help='Review mode (accepted for compatibility, no effect in simple mode)')
     parser.add_argument('--zotero', action='store_true', help='Export to Zotero after processing')
     parser.add_argument('--zotero-title', help='Custom title for Zotero item (defaults to filename)')
     parser.add_argument('--zotero-collection', help='Zotero collection name to file the item in')
@@ -603,30 +653,33 @@ Examples:
 
     # Validate PDF file
     if not Path(args.pdf).exists():
-        print(f"❌ Error: PDF file {args.pdf} not found")
+        print(f"❌ Error: PDF file {args.pdf} not found", flush=True)
         sys.exit(1)
 
     if not PDF_SUPPORT:
-        print("❌ Error: PDF support not available")
-        print("   Install with: pip install pdf2image")
+        print("❌ Error: PDF support not available", flush=True)
+        print("   Install with: pip install pdf2image", flush=True)
         sys.exit(1)
 
     # Process PDF
-    processor = ModernTextProcessor()
+    processor = ModernTextProcessor(model=args.model)
     result = processor.process_pdf(
         args.pdf,
         args.output,
         args.start_page,
         args.end_page,
+        max_pages=args.max_pages,
+        context=args.context,
+        review_mode=args.review,
         export_zotero=args.zotero,
         zotero_title=args.zotero_title,
         zotero_collection=args.zotero_collection
     )
 
     if result:
-        print("\n✓ Success!")
+        print("\n✓ Success!", flush=True)
     else:
-        print("\n✗ Processing failed")
+        print("\n✗ Processing failed", flush=True)
         sys.exit(1)
 
 if __name__ == "__main__":

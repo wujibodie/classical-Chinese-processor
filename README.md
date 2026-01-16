@@ -23,7 +23,8 @@ YOU WILL NEED
   
 ### **SETUP**
 
-1. **Install Python** (if you don't have it) and Poppler if not on PC.
+1. **Install Python** (if you don't have it) and Poppler if not on PC. 
+
 **Linux:**
 ```bash
 sudo apt install poppler-utils

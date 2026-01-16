@@ -13,7 +13,7 @@ There are various commands listed below to change how it processes your file(s).
 
 YOU WILL NEED
 1. AliCloud and DeepSeek API keys, as well as sufficient funds to use them.
-     - If you don't have these, go [here](https://www.alibabacloud.com/help/en/model-studio/get-api-key) and [here]([https://platform.moonshot.ai/docs/overview](https://api-docs.deepseek.com/)) and follow the steps. Note that for Qwen, you have the choice between a Chinese or international (Singapore) API key. The Chinese key will be cheaper, but requires a Chinese phone         number and ID verification. My script assumes you are using the international version, but you can easily adjust it to make calls to the Chinese servers. DeepSeek doesn't                distinguish and also won't require ID verification.
+     - If you don't have these, go [here](https://www.alibabacloud.com/help/en/model-studio/get-api-key) and [here](https://api-docs.deepseek.com/) and follow the steps. Note that for Qwen, you have the choice between a Chinese or international (Singapore) API key. The Chinese key will be cheaper, but requires a Chinese phone number and ID verification. My script assumes you are using the international version, but you can easily adjust it to make calls to the Chinese servers. DeepSeek doesn't distinguish and also won't require ID verification. 
      - I've implemented basic Zotero integration, so if you want to export directly to your Zotero account, you'll also need to set your Zotero API and user ID as environmental variables. 
 3. Basic familiarity with running python scripts in terminal.
      - Make sure you have Python installed, as well as all necessary dependencies: pdf2image, openai, and requests. Non-Windows users may need to separately install Poppler as well (it installs with Pdf2Image on PC)
@@ -42,7 +42,7 @@ brew install poppler
 4. **Set up API keys**
     ```bash
    export DASHSCOPE_API_KEY="your_alibaba_key"
-   export KIMI_API_KEY="your_moonshot_key"
+   export DEEPSEEK_API_KEY="your_deepseek_key"
     ## IF USING ZOTERO EXPORT
    export ZOTERO_API_KEY="your_zotero_key"
    export ZOTERO_USER_ID="your_user_ID"
@@ -74,6 +74,7 @@ TROUBLESHOOTING
 "No API keys found":
 - Make sure you set the environment variables　（your API keys)
 - Restart your terminal after setting them
+- Remember you can also use Kimi K2 (Moonshot) instead of DeepSeek, but you'll have to use a command or edit the configs.
 
 "No images were converted":
 - Check that pdf2image is installed: pip install pdf2image

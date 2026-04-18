@@ -7,9 +7,9 @@ There is also a simplified version of this script, called "simpleprox.py," which
 
 The price of the whole process averages around $0.01 per page, and the final results are better than you'll generally find anywhere else for obscure texts, if your scan is good quality. It won't give 100% accurate results, but it normally hits 90+% of characters correct in my tests. This is generally high enough for the full context to be clear, although you'll want to double check sections that are important to you against the original scan. Also, it is possible for whole chunks of text to get corrupted or lost, but this is rare unless the scanned text is in an unusual format or somehow damaged. In such cases the damage is normally limited to single pages or less.
 
-In general the OCR part takes around 1 min per page, while the cleanup is much faster since we can process text chunks in parallel. Thus a 500 page book might take several hours to process. The log will let you know how things are going and roughly how long everything is taking. It's normally safe to leave the program alone until it finishes, but you might want to check if any errors pop up. 
+In the most recent updates I've managed to speed up OCR processing to just a few minutes per bundle of 20-30 pages. In general a full book should finish in under half an hour. The log will let you know how things are going and roughly how long everything is taking. It's normally safe to leave the program alone until it finishes, but you might want to keep an eye on it to see if any errors pop up. 
 
-There are various commands listed below to change how it processes your file(s). You can also poke around in the configs inside the .py.
+There are various commands listed below to change how the script processes your file(s). You can also poke around in the configs inside the .py.
 
 YOU WILL NEED
 1. AliCloud and DeepSeek API keys, as well as sufficient funds to use them.
@@ -18,7 +18,7 @@ YOU WILL NEED
 3. Basic familiarity with running python scripts in terminal.
      - Make sure you have Python installed, as well as all necessary dependencies: pdf2image, openai, and requests. Non-Windows users may need to separately install Poppler as well (it installs with Pdf2Image on PC)
 4. A GOOD PDF scan of your document. If Qwen can't make any sense of your document things will break down. If it's not legible to you it likely won't be to the AI.
-   - If you want to test it, you can upload 1-5 pages of your PDF (converted) in a chat with the OCR-bot [here]([https://modelstudio.console.alibabacloud.com/?tab=dashboard#/efm/prompt?modelId=qwen3-vl-plus](https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=dashboard#/efm/model_experience_center/vision))
+   - If you want to test it, you can upload 1-5 pages of your PDF in a chat with the OCR-bot [here]([https://modelstudio.console.alibabacloud.com/?tab=dashboard#/efm/prompt?modelId=qwen3-vl-plus](https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=dashboard#/efm/model_experience_center/vision))
    - There are several processes built in to clean up OCR mistakes, but the bulk of the text needs to be usable for those to work!
   
 ### **SETUP**
@@ -35,12 +35,12 @@ sudo apt install poppler-utils
 brew install poppler
 ```
 
-3. **Install this script and necessary packages**:
+2. **Install this script and necessary packages**:
     ```bash
     pip install pdf2image opencv-python openai requests numpy PyPDF2
    git clone [https://github.com/wujibodie/classical-Chinese-processor]
     ```
-4. **Set up API keys**
+3. **Set up API keys**
     ```bash
    export DASHSCOPE_API_KEY="your_alibaba_key"
    export DEEPSEEK_API_KEY="your_deepseek_key"
@@ -49,7 +49,7 @@ brew install poppler
    export ZOTERO_USER_ID="your_user_ID"
     ```
    (Windows users replace "export" with "set")
-5. **Run the script**
+4. **Run the script**
     ```bash
      python3 cc-prox.py yourdocument.pdf --output ./processed
     ```
@@ -62,7 +62,7 @@ COMMANDS (Run these in terminal afer the script name)
 - batch: process all files in a directory (replace input w/ this); while order output by filename order
 - dpi: choose DPI for PDF conversion (default is 300)
 - model: choose Qwen model, default is qwen3-vl-plus.
-- cleanup-model: change cleanup model. script comes with Kimi K2 enabled by default, you could also add your own preference.
+- cleanup-model: change cleanup model. script comes with DeepSeek enabled by default, Kimi K2.5 as backup, but you can add your own preferred model.
 - max-pages: limit processing to first N pages
 - start-page: start processing from page N
 - resume-from: start processing from raw OCR JSON file (in case a run was interrupted).
@@ -86,3 +86,7 @@ Poor OCR quality:
 - Make sure --context is set and accurate
 - Compare raw OCR output (JSON file in your output folder) to the final product to see whether the issue is at the first OCR step or in the post-processing.
 - Consider altering the OCR configs in the script under ProcessingConfig (lines 50-53); by default dpi is set to 300 and max image width to 3072 pixels. If you're feeding it very large PDF pages, the compression might damage their legibility. Note that higher pixel count will increase costs.
+
+Pages missing:
+- Sometimes this is due to timeouts with the API calls to Alibaba servers. You should see this in the log: you'll see timeouts and several retries. In that case, just rerun the page and it should work.
+- Very occasionally the API will refuse to output a given chunk of text due to some string registering as "sensitive" and getting censored. This seems to be a problem with DeepSeek more than other services. If you have trouble with this, try switching providers to Gemini (more expensive but less strict content filters). 

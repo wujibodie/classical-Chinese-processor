@@ -85,7 +85,7 @@ Poor OCR quality:
 - Test a page first with --max-pages 1
 - Make sure --context is set and accurate
 - Compare raw OCR output (JSON file in your output folder) to the final product to see whether the issue is at the first OCR step or in the post-processing.
-- Consider altering the OCR configs in the script under ProcessingConfig (lines 50-53); by default dpi is set to 300 and max image width to 3072 pixels. If you're feeding it very large PDF pages, the compression might damage their legibility. Note that higher pixel count will increase costs.
+- Consider altering the OCR configs in the script under ProcessingConfig; by default dpi is set to 300 and max image width to 3072 pixels. If you're feeding it very large PDF pages, the compression might damage their legibility. Note that higher pixel count will increase costs.
 
 Pages missing:
 - Sometimes this is due to timeouts with the API calls to Alibaba servers. You should see this in the log: you'll see timeouts and several retries. In that case, just rerun the page and it should work.

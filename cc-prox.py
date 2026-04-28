@@ -1588,7 +1588,7 @@ class DocumentProcessor:
                     if result is None:
                         print(f"  ❌ Page {page_num}: OCR returned None", flush=True)
                         continue
-                    text, has_loops = result
+                    _, text, has_loops = result
                     if text:
                         results[page_num] = text
                         if has_loops:

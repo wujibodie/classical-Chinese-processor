@@ -18,7 +18,7 @@ YOU WILL NEED
 3. Basic familiarity with running python scripts in terminal.
      - Make sure you have Python installed, as well as all necessary dependencies: pdf2image, openai, and requests. Non-Windows users may need to separately install Poppler as well (it installs with Pdf2Image on PC)
 4. A GOOD PDF scan of your document. If Qwen can't make any sense of your document things will break down. If it's not legible to you it likely won't be to the AI.
-   - If you want to test it, you can upload 1-5 pages of your PDF in a chat with the OCR-bot [here]([https://modelstudio.console.alibabacloud.com/?tab=dashboard#/efm/prompt?modelId=qwen3-vl-plus])
+   - If you want to test it, you can upload 1-5 pages of your PDF in a chat with the OCR-bot [here](https://modelstudio.console.alibabacloud.com/?tab=dashboard#/efm/prompt?modelId=qwen3-vl-plus)
    - There are several processes built in to clean up OCR mistakes, but the bulk of the text needs to be usable for those to work!
   
 ### **SETUP**
